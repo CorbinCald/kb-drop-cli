@@ -1,0 +1,50 @@
+{
+  "name": "@kbdrop/cli",
+  "version": "0.1.1",
+  "description": "Official command-line interface for querying kbDrop knowledge bases",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "kb-drop": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CorbinCald/kb-drop-cli.git"
+  },
+  "homepage": "https://github.com/CorbinCald/kb-drop-cli#readme",
+  "bugs": {
+    "url": "https://github.com/CorbinCald/kb-drop-cli/issues"
+  },
+  "packageManager": "pnpm@10.33.0",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "prepack": "pnpm test && pnpm build"
+  },
+  "dependencies": {
+    "cross-keychain": "1.1.0",
+    "open": "11.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.1",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}

@@ -1,0 +1,60 @@
+name: Stage npm release
+run-name: Stage @kbdrop/cli@${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact package version to stage
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cli-npm-release
+  cancel-in-progress: false
+
+jobs:
+  stage:
+    name: Stage @kbdrop/cli
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Install trusted-publishing npm version
+        run: npm install --global npm@11.19.0
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Check requested version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          package_version="$(node -p "require('./package.json').version")"
+          if [[ "$package_version" != "$REQUESTED_VERSION" ]]; then
+            echo "Requested $REQUESTED_VERSION, but package.json contains $package_version." >&2
+            exit 1
+          fi
+      - name: Test
+        run: pnpm test
+      - name: Build
+        run: pnpm build
+      - name: Stage package with OIDC provenance
+        run: npm stage publish --access public --provenance
