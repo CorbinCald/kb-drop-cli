@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { createServer, type Server } from "node:http";
+import { createServer, type Server, type ServerResponse } from "node:http";
 import open from "open";
 import type { Writable } from "node:stream";
 import { CliError } from "./errors.js";
@@ -289,6 +289,23 @@ function closeServer(server: Server): void {
   server.close();
 }
 
+// A verified callback ends on kbDrop's own result page, which carries the
+// site's styling. It is same-origin with the consent page, so that page's CSP
+// `form-action 'self'` allows this second redirect.
+function showResultPage(
+  response: ServerResponse,
+  issuer: string,
+  page: "connected" | "not-connected",
+): void {
+  response
+    .writeHead(303, {
+      Location: new URL(`/cli/${page}`, issuer).toString(),
+      "Cache-Control": "no-store",
+      "Referrer-Policy": "no-referrer",
+    })
+    .end();
+}
+
 async function loopbackCallback(input: {
   state: string;
   issuer: string;
@@ -330,22 +347,16 @@ async function loopbackCallback(input: {
     settled = true;
     if (oauthError) {
       const code = safeOAuthErrorCode(oauthError);
-      response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" }).end("Authorization was not completed. Return to your terminal.");
+      showResultPage(response, input.issuer, "not-connected");
       rejectCode(new CliError("auth", code, safeOAuthErrorMessage(code)));
       return;
     }
     if (!code || !AUTHORIZATION_CODE_PATTERN.test(code)) {
-      response.writeHead(400).end("Missing authorization code");
+      showResultPage(response, input.issuer, "not-connected");
       rejectCode(new CliError("auth", "authorization_code_missing", "The OAuth callback did not include an authorization code."));
       return;
     }
-    response
-      .writeHead(200, {
-        "Content-Type": "text/html; charset=utf-8",
-        "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
-        "Cache-Control": "no-store",
-      })
-      .end("<!doctype html><title>kbDrop CLI connected</title><h1>kbDrop CLI connected</h1><p>You can close this window and return to your terminal.</p>");
+    showResultPage(response, input.issuer, "connected");
     resolveCode(code);
   });
   await new Promise<void>((resolve, reject) => {
