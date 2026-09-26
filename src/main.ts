@@ -33,7 +33,7 @@ import {
   type OutputStreams,
 } from "./output.js";
 
-export const VERSION = "0.1.1";
+export const VERSION = "0.1.2";
 const DEFAULT_API_URL = "https://kbdrop.io";
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;

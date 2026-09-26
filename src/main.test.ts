@@ -344,12 +344,21 @@ describe("@kbdrop/cli", () => {
           expect(new URL(redirectUri).hostname).toBe("127.0.0.1");
           const callback = new URL(redirectUri);
           callback.searchParams.set("code", authorizationCode);
+          callback.searchParams.set("state", "forged-state");
+          callback.searchParams.set("iss", apiUrl);
+          const forged = await fetch(callback, { redirect: "manual" });
+          expect(forged.status).toBe(400);
+          expect(forged.headers.get("location")).toBeNull();
           callback.searchParams.set(
             "state",
             authorization.searchParams.get("state") ?? "",
           );
-          callback.searchParams.set("iss", apiUrl);
-          await fetch(callback);
+          const verified = await fetch(callback, { redirect: "manual" });
+          expect(verified.status).toBe(303);
+          expect(verified.headers.get("location")).toBe(
+            `${apiUrl}/cli/connected`,
+          );
+          expect(verified.headers.get("referrer-policy")).toBe("no-referrer");
         },
       },
       { openBrowser: true, timeoutMs: 30_000 },
@@ -364,6 +373,61 @@ describe("@kbdrop/cli", () => {
     expect(stderr.value()).toContain("Open this URL to authorize kbDrop CLI:");
     expect(stderr.value()).not.toContain(accessToken);
     expect(stderr.value()).not.toContain(refreshToken);
+  });
+
+  it.each([
+    ["a denied", { error: "access_denied" }, "access_denied"],
+    ["a codeless", {}, "authorization_code_missing"],
+  ] as const)("sends %s browser login to kbDrop's not-connected page", async (
+    _outcome,
+    parameters: Record<string, string>,
+    code,
+  ) => {
+    const store = new MemoryStore();
+    const fetchImpl: typeof fetch = async (input) => {
+      if (String(input).endsWith("/.well-known/oauth-authorization-server")) {
+        return Response.json({
+          issuer: apiUrl,
+          authorization_endpoint: `${apiUrl}/oauth/authorize`,
+          token_endpoint: `${apiUrl}/oauth/token`,
+          revocation_endpoint: `${apiUrl}/oauth/revoke`,
+          device_authorization_endpoint: `${apiUrl}/oauth/device/code`,
+        });
+      }
+      throw new Error("Unexpected OAuth request");
+    };
+    let denial = null as Promise<Response> | null;
+    await expect(
+      browserLogin(
+        apiUrl,
+        {
+          store,
+          fetchImpl,
+          stderr: capture().stream,
+          openUrl: async (value) => {
+            const authorization = new URL(value);
+            const callback = new URL(
+              authorization.searchParams.get("redirect_uri") ?? "",
+            );
+            for (const [name, value] of Object.entries(parameters)) {
+              callback.searchParams.set(name, value);
+            }
+            callback.searchParams.set(
+              "state",
+              authorization.searchParams.get("state") ?? "",
+            );
+            callback.searchParams.set("iss", apiUrl);
+            // Like a real launcher, return while the browser is under way.
+            denial = fetch(callback, { redirect: "manual" });
+          },
+        },
+        { openBrowser: true, timeoutMs: 30_000 },
+      ),
+    ).rejects.toMatchObject({ kind: "auth", code });
+    const response = await denial!;
+    expect(response.status).toBe(303);
+    expect(response.headers.get("location")).toBe(`${apiUrl}/cli/not-connected`);
+    expect(store.value).toBeNull();
   });
 
   it("handles device pending, slow-down, and approval without printing tokens", async () => {
