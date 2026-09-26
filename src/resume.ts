@@ -6,15 +6,9 @@ import { CliError } from "./errors.js";
 import { UUID_PATTERN } from "./management.js";
 
 const RECORD_VERSION = 1;
-// Resume exists for interruptions. After a day the same command starts a new
-// knowledge base instead of replaying an old one.
+// Resume exists for interruptions. After a day the same command starts over
+// instead of replaying an old request.
 const RECORD_TTL_MS = 24 * 60 * 60 * 1_000;
-
-type PendingRecord = {
-  version: typeof RECORD_VERSION;
-  idempotency_key: string;
-  created_at: string;
-};
 
 export type PendingOperation = {
   idempotencyKey: string;
@@ -26,10 +20,22 @@ export type PendingOperation = {
   finish(): Promise<void>;
 };
 
+export type RetryTarget = { jobId: string; attempt: number };
+
+export type PendingRetry = {
+  /** The failed attempt an earlier, interrupted run already asked to retry. */
+  target: RetryTarget | null;
+  /** Remembers the failed attempt before its retry is sent. */
+  save(target: RetryTarget): Promise<void>;
+  /** Forgets the attempt, so running the same command again retries anew. */
+  finish(): Promise<void>;
+};
+
 /**
  * Where interrupted operations are remembered: KB_DROP_STATE_DIR, else the
- * platform's per-user state directory. Records hold an idempotency key and a
- * timestamp, never credentials, paths, or file contents.
+ * platform's per-user state directory. Records hold an idempotency key, or a
+ * retried job's ID and attempt, and a timestamp, never credentials, paths, or
+ * file contents.
  */
 export function stateDirectory(environment: NodeJS.ProcessEnv): string {
   if (environment.KB_DROP_STATE_DIR) return resolve(environment.KB_DROP_STATE_DIR);
@@ -42,32 +48,77 @@ export function stateDirectory(environment: NodeJS.ProcessEnv): string {
   return join(environment.XDG_STATE_HOME || join(homedir(), ".local", "state"), "kb-drop");
 }
 
-function unavailable(): CliError {
+function unavailable(alternative: string): CliError {
   return new CliError(
     "usage",
     "state_directory_unavailable",
-    "Resume state could not be saved. Set KB_DROP_STATE_DIR to a writable directory, or pass --idempotency-key.",
+    `Resume state could not be saved. Set KB_DROP_STATE_DIR to a writable directory${alternative}.`,
   );
 }
 
-function parseRecord(encoded: string, now: number): PendingRecord | null {
-  try {
-    const value = JSON.parse(encoded) as Partial<PendingRecord>;
-    const createdAt = Date.parse(String(value.created_at));
-    if (
-      value.version === RECORD_VERSION &&
-      typeof value.idempotency_key === "string" &&
-      UUID_PATTERN.test(value.idempotency_key) &&
-      Number.isFinite(createdAt) &&
-      now - createdAt < RECORD_TTL_MS &&
-      createdAt <= now + 60_000
-    ) {
-      return value as PendingRecord;
-    }
-  } catch {
-    // A damaged record is replaced below.
-  }
-  return null;
+/**
+ * The file that remembers one request between runs, named by a digest of the
+ * API URL and the request. `read` returns its fields while they are current.
+ */
+function pendingRecord(input: {
+  environment: NodeJS.ProcessEnv;
+  apiUrl: string;
+  request: unknown;
+  now: number;
+  /** How to proceed without a state directory, if there is another way. */
+  alternative: string;
+}) {
+  const directory = join(stateDirectory(input.environment), "pending-operations");
+  const digest = createHash("sha256")
+    .update(JSON.stringify({ api_url: input.apiUrl, request: input.request }))
+    .digest("hex");
+  const path = join(directory, `${digest}.json`);
+
+  return {
+    async read(): Promise<Record<string, unknown> | null> {
+      let encoded: string;
+      try {
+        encoded = await readFile(path, "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw unavailable(input.alternative);
+      }
+      try {
+        const value = JSON.parse(encoded) as Record<string, unknown>;
+        const createdAt = Date.parse(String(value.created_at));
+        if (
+          value.version === RECORD_VERSION &&
+          Number.isFinite(createdAt) &&
+          input.now - createdAt < RECORD_TTL_MS &&
+          createdAt <= input.now + 60_000
+        ) {
+          return value;
+        }
+      } catch {
+        // A damaged record is replaced when the command saves its own.
+      }
+      return null;
+    },
+    async save(fields: Record<string, unknown>): Promise<void> {
+      const record = {
+        version: RECORD_VERSION,
+        ...fields,
+        created_at: new Date(input.now).toISOString(),
+      };
+      const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+      try {
+        await mkdir(directory, { recursive: true, mode: 0o700 });
+        await writeFile(temporary, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+        await rename(temporary, path);
+      } catch {
+        await rm(temporary, { force: true }).catch(() => undefined);
+        throw unavailable(input.alternative);
+      }
+    },
+    async remove(): Promise<void> {
+      await rm(path, { force: true }).catch(() => undefined);
+    },
+  };
 }
 
 /**
@@ -83,48 +134,57 @@ export async function pendingOperation(input: {
   request: unknown;
   now: number;
 }): Promise<PendingOperation> {
-  const directory = join(stateDirectory(input.environment), "pending-operations");
-  const digest = createHash("sha256")
-    .update(JSON.stringify({ api_url: input.apiUrl, request: input.request }))
-    .digest("hex");
-  const path = join(directory, `${digest}.json`);
-
-  const save = async (idempotencyKey: string): Promise<void> => {
-    const record: PendingRecord = {
-      version: RECORD_VERSION,
-      idempotency_key: idempotencyKey,
-      created_at: new Date(input.now).toISOString(),
-    };
-    const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-    try {
-      await mkdir(directory, { recursive: true, mode: 0o700 });
-      await writeFile(temporary, `${JSON.stringify(record)}\n`, { mode: 0o600 });
-      await rename(temporary, path);
-    } catch {
-      await rm(temporary, { force: true }).catch(() => undefined);
-      throw unavailable();
-    }
-  };
-
-  let existing: PendingRecord | null = null;
-  try {
-    existing = parseRecord(await readFile(path, "utf8"), input.now);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw unavailable();
-  }
+  const record = pendingRecord({ ...input, alternative: ", or pass --idempotency-key" });
+  const saved = await record.read();
+  const existing =
+    typeof saved?.idempotency_key === "string" && UUID_PATTERN.test(saved.idempotency_key)
+      ? saved.idempotency_key
+      : null;
   const pending: PendingOperation = {
-    idempotencyKey: existing?.idempotency_key ?? randomUUID(),
+    idempotencyKey: existing ?? randomUUID(),
     resumed: existing !== null,
     async restart() {
       pending.idempotencyKey = randomUUID();
       pending.resumed = false;
-      await save(pending.idempotencyKey);
+      await record.save({ idempotency_key: pending.idempotencyKey });
       return pending.idempotencyKey;
     },
-    async finish() {
-      await rm(path, { force: true }).catch(() => undefined);
-    },
+    finish: () => record.remove(),
   };
-  if (!existing) await save(pending.idempotencyKey);
+  if (!existing) await record.save({ idempotency_key: pending.idempotencyKey });
   return pending;
+}
+
+/**
+ * Remembers which failed attempt a retry named. The attempt is what makes a
+ * retry idempotent, so rerunning an interrupted retry replays it and follows
+ * that attempt, instead of retrying whichever attempt is latest by then.
+ */
+export async function pendingRetry(input: {
+  environment: NodeJS.ProcessEnv;
+  apiUrl: string;
+  knowledgeBaseId: string;
+  now: number;
+}): Promise<PendingRetry> {
+  const record = pendingRecord({
+    environment: input.environment,
+    apiUrl: input.apiUrl,
+    request: { operation: "retry", knowledge_base_id: input.knowledgeBaseId },
+    now: input.now,
+    alternative: "",
+  });
+  const saved = await record.read();
+  const target =
+    typeof saved?.job_id === "string" &&
+    UUID_PATTERN.test(saved.job_id) &&
+    typeof saved.attempt === "number" &&
+    Number.isSafeInteger(saved.attempt) &&
+    saved.attempt >= 1
+      ? { jobId: saved.job_id, attempt: saved.attempt }
+      : null;
+  return {
+    target,
+    save: ({ jobId, attempt }) => record.save({ job_id: jobId, attempt }),
+    finish: () => record.remove(),
+  };
 }

@@ -60,7 +60,7 @@ everything.
 | `--api-url URL` or `KB_DROP_API_URL` | kbDrop origin, `https://kbdrop.io` by default. Plain HTTP is accepted only for `localhost`, `127.0.0.1`, and `[::1]` |
 | `KB_DROP_MANAGEMENT_KEY`, `KB_DROP_API_KEY` | Credentials, as above |
 | `KB_DROP_KNOWLEDGE_BASE_ID` | Default knowledge base for `ask` and `search`; `knowledge-bases` commands always take the ID explicitly |
-| `KB_DROP_STATE_DIR` | Where unfinished commands keep their resume keys; see [Uploads and resuming](#uploads-and-resuming) |
+| `KB_DROP_STATE_DIR` | Where unfinished commands keep their resume state; see [Uploads and resuming](#uploads-and-resuming) |
 | `--timeout MS`, `--retries N` | Per-request timeout (1000–120000, default 30000) and retries after `429`, `503`, or a network failure (0–5, default 2) |
 
 ## Creating knowledge bases
@@ -106,15 +106,16 @@ It never creates a second knowledge base, job, or quota reservation for the
 same run. Once a command finishes, its key is forgotten, so running it again
 creates another knowledge base. Unfinished keys expire after 24 hours. If the
 interrupted upload itself expired, the CLI says so and starts a new knowledge
-base.
+base. `retry` saves the failed attempt it retries in the same way, so running it
+again follows that attempt instead of queuing another.
 
 The state directory is `KB_DROP_STATE_DIR`, or by default
 `$XDG_STATE_HOME/kb-drop` (`~/.local/state/kb-drop`) on Linux,
 `~/Library/Application Support/kb-drop` on macOS, and `%LOCALAPPDATA%\kb-drop`
-on Windows. Records hold only a key and a timestamp, never credentials, file
-contents, or paths. To manage keys yourself instead, pass
-`--idempotency-key UUID`: the same key and request always return the same
-knowledge base, and the same key with a different request fails with
+on Windows. Records hold only a key, or a retried job's ID and attempt, and a
+timestamp, never credentials, file contents, or paths. To manage keys yourself
+instead, pass `--idempotency-key UUID`: the same key and request always return
+the same knowledge base, and the same key with a different request fails with
 `idempotency_mismatch`.
 
 ### Waiting, status, and follow-up
@@ -126,8 +127,9 @@ knowledge base, and the same key with a different request fails with
 - `status ID` reports the knowledge base and its latest ingestion job.
 - `list [--limit N] [--cursor CURSOR]` pages through the account's knowledge
   bases, newest first.
-- `retry ID` requeues a failed job when its `next_action` is `retry`.
-  Repeating the command never queues a second attempt.
+- `retry ID` requeues a failed job when its `next_action` is `retry`. Rerun
+  after an interruption, it follows the attempt it already queued; once it has
+  reported how that attempt ended, running it again retries anew.
 - `recrawl ID` crawls a website knowledge base again as a new version; the
   current version keeps answering until the new one is ready.
 
@@ -136,9 +138,9 @@ knowledge base, and the same key with a different request fails with
 With `--json`, stdout carries exactly one object:
 `{"schema_version":"1","ok":true,"command":"knowledge-bases.create","data":{…}}`.
 For `create`, `data` holds `knowledge_base`, `ingestion_job`, `upload` (`null`
-for URLs), `resumed`, and `idempotency_key`; `status`, `retry`, and `recrawl`
-return `knowledge_base` and `ingestion_job`; `list` returns the API's list
-object. The resources match the
+for URLs), `resumed`, and `idempotency_key`; `status` returns `knowledge_base`
+and `ingestion_job`, `retry` adds `resumed`, and `recrawl` adds `resumed` and
+`idempotency_key`; `list` returns the API's list object. The resources match the
 [management API](https://kbdrop.io/docs/api/management.md).
 
 Progress goes to stderr: readable lines by default, or with `--json` one JSON

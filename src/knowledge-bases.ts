@@ -28,7 +28,7 @@ import {
   type OutputStreams,
   type ProgressEvent,
 } from "./output.js";
-import { pendingOperation } from "./resume.js";
+import { pendingOperation, pendingRetry, type PendingRetry } from "./resume.js";
 import type { IngestionJob, KnowledgeBase, Upload } from "./types.js";
 import {
   finishUpload,
@@ -722,6 +722,24 @@ function notRetryable(job: IngestionJob): CliError {
   );
 }
 
+/**
+ * Replays the retry an interrupted run sent. Returns null, forgetting it, when
+ * a newer job has replaced that one, so the latest job is retried instead.
+ */
+async function replayRetry(
+  client: ManagementClient,
+  pending: PendingRetry,
+): Promise<{ replayed: boolean; job: IngestionJob } | null> {
+  const { jobId, attempt } = pending.target!;
+  try {
+    return await client.retryIngestionJob(jobId, attempt);
+  } catch (error) {
+    if (!(error instanceof CliError) || error.code !== "ingestion_job_superseded") throw error;
+    await pending.finish();
+    return null;
+  }
+}
+
 async function retry(context: ManagementContext): Promise<number> {
   const { arguments_, output } = context;
   const command = "knowledge-bases retry";
@@ -736,23 +754,40 @@ async function retry(context: ManagementContext): Promise<number> {
   const client = await managementClient(context, [READ, WRITE]);
   const report = progressWriter(output, context.json, "knowledge-bases.retry");
   let knowledgeBase = await client.getKnowledgeBase(id);
-  const failed = await client.getIngestionJob(knowledgeBase.latest_job.id);
-  if (failed.next_action !== "retry") throw notRetryable(failed);
-  // Naming the failed attempt makes a repeated retry a replay, not a second run.
-  let { job } = await client.retryIngestionJob(failed.id, failed.attempt);
+  const pending = await pendingRetry({
+    environment: context.environment,
+    apiUrl: context.origin,
+    knowledgeBaseId: id.toLowerCase(),
+    now: context.now(),
+  });
+  // An interrupted run follows the attempt it retried, even once that attempt
+  // has failed too, rather than retrying whichever attempt is now the latest.
+  let retried = pending.target ? await replayRetry(client, pending) : null;
+  if (!retried) {
+    const failed = await client.getIngestionJob(knowledgeBase.latest_job.id);
+    if (failed.next_action !== "retry") throw notRetryable(failed);
+    // Naming the failed attempt makes a repeated retry a replay, not a second
+    // run. It is saved first, so a rerun after a lost response replays it too.
+    await pending.save({ jobId: failed.id, attempt: failed.attempt });
+    retried = await client.retryIngestionJob(failed.id, failed.attempt);
+  }
+  let { job } = retried;
   report(ingestionEvent(job));
   const outcome = await maybeWait(client, job, context, wait, report);
   if (outcome) job = outcome.job;
+  // Once this reports how the attempt ended, running it again retries anew.
+  if (!outcome || outcome.settled === "terminal") await pending.finish();
   knowledgeBase = await client.getKnowledgeBase(id);
   if (context.json) {
     writeJsonSuccess(output, "knowledge-bases.retry", {
       knowledge_base: knowledgeBase,
       ingestion_job: job,
+      resumed: retried.replayed,
     });
   } else {
     writeHumanResult(
       output,
-      `Retrying "${printable(knowledgeBase.name)}" (${knowledgeBase.id}), attempt ${job.attempt}.`,
+      `${retried.replayed ? "Resumed retrying" : "Retrying"} "${printable(knowledgeBase.name)}" (${knowledgeBase.id}), attempt ${job.attempt}.`,
       knowledgeBase,
       job,
       outcome,

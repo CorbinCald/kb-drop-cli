@@ -135,7 +135,7 @@ Exit codes:
 Environment:
   KB_DROP_API_URL            Default for --api-url
   KB_DROP_KNOWLEDGE_BASE_ID  Default knowledge base for ask and search
-  KB_DROP_STATE_DIR          Where unfinished commands keep their resume keys
+  KB_DROP_STATE_DIR          Where unfinished commands keep their resume state
 
 Authentication:
   OAuth credentials are stored in the native OS credential store.

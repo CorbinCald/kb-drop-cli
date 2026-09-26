@@ -27,7 +27,6 @@ type Job = {
   failure: Failure | null;
   files: { discovered: number; processed: number; skipped: number; failed: number };
   uploadId: string | null;
-  retriedFromAttempt: number | null;
 };
 
 type KnowledgeBaseRecord = {
@@ -131,6 +130,8 @@ export class FakeKbDrop {
   initializingReplies = 0;
   /** Creates this many knowledge bases but loses the response, as a dropped connection does. */
   lostCreateResponses = 0;
+  /** Retries this many jobs but loses the response. */
+  lostRetryResponses = 0;
   /** Complete replies 202 this many times while storage assembles the parts. */
   completingReplies = 0;
   /** Parts storage discards once while assembling the upload, as a rejected part is. */
@@ -296,7 +297,6 @@ export class FakeKbDrop {
       failure: null,
       files: { discovered: 0, processed: 0, skipped: 0, failed: 0 },
       uploadId: null,
-      retriedFromAttempt: null,
     };
     this.jobs.set(job.id, job);
     return job;
@@ -649,22 +649,31 @@ export class FakeKbDrop {
       if (denied) return denied;
       const job = this.jobs.get(match[1]!);
       if (!job) return apiError(404, "ingestion_job_not_found", "check_identifier");
-      if (job.retriedFromAttempt === input.attempt) {
+      // As on the server: only the latest job retries, and naming an attempt
+      // that was already retried replays that retry, however it has gone since.
+      if (this.knowledgeBases.get(job.knowledgeBaseId)!.latestJobId !== job.id) {
+        return apiError(409, "ingestion_job_superseded", "fix_request");
+      }
+      const attempt = Number(input.attempt);
+      if (job.attempt > attempt) {
         return Response.json(this.serializeJob(job), {
           headers: { "X-Idempotent-Replay": "true" },
         });
       }
+      if (job.attempt < attempt) {
+        return apiError(409, "ingestion_attempt_mismatch", "fix_request");
+      }
       if (job.status !== "failed" || job.failure?.recovery !== "retry") {
         return apiError(409, "ingestion_not_retryable", "create_new_knowledge_base");
       }
-      if (input.attempt !== job.attempt) {
-        return apiError(409, "ingestion_attempt_mismatch", "fix_request");
-      }
-      job.retriedFromAttempt = job.attempt;
       job.attempt += 1;
       job.status = "queued";
       job.failure = null;
       job.script = [...this.jobScript];
+      if (this.lostRetryResponses > 0) {
+        this.lostRetryResponses -= 1;
+        throw new TypeError("fetch failed");
+      }
       return Response.json(this.serializeJob(job), { status: 202 });
     }
 

@@ -670,6 +670,84 @@ describe("knowledge-bases status, list, retry, and recrawl", () => {
     );
   });
 
+  it("follows the attempt an interrupted retry started, even after it fails again", async () => {
+    const fake = new FakeKbDrop();
+    const { knowledgeBaseId, jobId } = fake.addKnowledgeBase({
+      name: "Flaky",
+      source: { type: "web", url: "https://docs.example.com", mode: "site" },
+      status: "failed",
+    });
+    fake.jobScript = ["parsing", "failed"];
+    fake.lostRetryResponses = 1;
+    const clock = new Clock();
+    const argv = ["kb", "retry", knowledgeBaseId, "--wait", "--wait-timeout", "5", "--json"];
+    const retryBodies = () => fake.apiRequests(/\/retry$/u).map((request) => request.body);
+
+    const lost = await run(fake, [...argv, "--retries", "0"], { clock });
+    expect(lost.exitCode).toBe(6);
+    expect(await pendingRecords()).toHaveLength(1);
+
+    // Rerun while the retried attempt runs: the same retry is replayed and waited on.
+    const running = await run(fake, argv, { clock });
+    expect(running.exitCode).toBe(10);
+    expect(json(running.stdout).data).toMatchObject({
+      resumed: true,
+      ingestion_job: { id: jobId, attempt: 2, status: "parsing" },
+    });
+
+    // Rerun after that attempt failed too: the failure is reported, not retried.
+    const failed = await run(fake, argv, { clock });
+    expect(failed.exitCode).toBe(9);
+    expect(json(failed.stdout).data).toMatchObject({
+      resumed: true,
+      ingestion_job: { id: jobId, attempt: 2, status: "failed" },
+    });
+    expect(retryBodies()).toEqual([{ attempt: 1 }, { attempt: 1 }, { attempt: 1 }]);
+    expect(await pendingRecords()).toEqual([]);
+
+    // Once that failure is reported, the same command retries it.
+    fake.jobScript = ["parsing", "ready"];
+    const again = await run(fake, ["kb", "retry", knowledgeBaseId, "--wait", "--json"], { clock });
+    expect(again.exitCode).toBe(0);
+    expect(json(again.stdout).data).toMatchObject({
+      resumed: false,
+      ingestion_job: { id: jobId, attempt: 3, status: "ready" },
+    });
+    expect(retryBodies().at(-1)).toEqual({ attempt: 2 });
+    expect(await pendingRecords()).toEqual([]);
+  });
+
+  it("retries the latest job when a recrawl replaced the one an interrupted retry started", async () => {
+    const fake = new FakeKbDrop();
+    const { knowledgeBaseId, jobId } = fake.addKnowledgeBase({
+      name: "Site",
+      source: { type: "web", url: "https://docs.example.com", mode: "site" },
+      status: "failed",
+    });
+    fake.jobScript = ["failed"];
+    fake.lostRetryResponses = 1;
+
+    const lost = await run(fake, ["kb", "retry", knowledgeBaseId, "--retries", "0", "--json"]);
+    expect(lost.exitCode).toBe(6);
+    // The retried attempt fails, and so does crawling the site again.
+    expect((await run(fake, ["kb", "status", knowledgeBaseId])).stdout).toContain("Failed");
+    expect((await run(fake, ["kb", "recrawl", knowledgeBaseId, "--wait"])).exitCode).toBe(9);
+    const recrawlJobId = fake.knowledgeBases.get(knowledgeBaseId)!.latestJobId;
+
+    fake.jobScript = ["parsing", "ready"];
+    const retried = await run(fake, ["kb", "retry", knowledgeBaseId, "--wait", "--json"]);
+
+    expect(retried.exitCode).toBe(0);
+    expect(fake.apiRequests(/\/retry$/u).map((request) => request.url)).toEqual(
+      [jobId, jobId, recrawlJobId].map((id) => `${API_URL}/v1/ingestion-jobs/${id}/retry`),
+    );
+    expect(json(retried.stdout).data).toMatchObject({
+      resumed: false,
+      ingestion_job: { id: recrawlJobId, attempt: 2, status: "ready" },
+    });
+    expect(await pendingRecords()).toEqual([]);
+  });
+
   it("recrawls a website under one idempotency key and refuses other sources", async () => {
     const fake = new FakeKbDrop();
     const website = fake.addKnowledgeBase({
