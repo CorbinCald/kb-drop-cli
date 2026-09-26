@@ -133,6 +133,8 @@ export class FakeKbDrop {
   lostCreateResponses = 0;
   /** Complete replies 202 this many times while storage assembles the parts. */
   completingReplies = 0;
+  /** Parts storage discards once while assembling the upload, as a rejected part is. */
+  rejectOnComplete: number[] = [];
   /** Decides the fate of each storage PUT: a response, a thrown error, or success. */
   onPut: (partNumber: number, attempt: number) => PutFault = () => undefined;
   /** Fails the create request itself, e.g. with a quota error. */
@@ -728,6 +730,15 @@ export class FakeKbDrop {
     }
     if (upload.confirmed.size < upload.partCount) {
       return apiError(409, "parts_incomplete", "upload_missing_parts");
+    }
+    if (this.rejectOnComplete.length > 0) {
+      const stored = this.storedParts.get(upload.id);
+      for (const partNumber of this.rejectOnComplete) {
+        upload.confirmed.delete(partNumber);
+        stored?.delete(partNumber);
+      }
+      this.rejectOnComplete = [];
+      return apiError(409, "upload_parts_rejected", "upload_missing_parts");
     }
     if (this.completingReplies > 0) {
       this.completingReplies -= 1;

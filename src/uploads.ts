@@ -41,6 +41,12 @@ type UploadDependencies = {
   sleep: (milliseconds: number) => Promise<void>;
   random?: () => number;
   onProgress: (progress: UploadProgress) => void;
+  /**
+   * Reads the upload's current state again with the knowledge_bases:write
+   * scope that uploading needs, since the credential may not also carry
+   * knowledge_bases:read.
+   */
+  reload: () => Promise<Upload>;
 };
 
 function fileChanged(): CliError {
@@ -327,7 +333,7 @@ export async function finishUpload(
           error instanceof CliError &&
           (error.code === "parts_incomplete" || error.code === "upload_parts_rejected")
         ) {
-          upload = await dependencies.client.getUpload(upload.id);
+          upload = await dependencies.reload();
           rejected = true;
         } else {
           throw error;

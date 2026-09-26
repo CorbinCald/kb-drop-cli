@@ -114,7 +114,7 @@ async function localFile(name: string, bytes: Buffer = FILE_BYTES): Promise<stri
 /** The fields tests read directly; `toMatchObject` checks the rest. */
 interface CliJson {
   data: {
-    upload: { id: string };
+    upload: { id: string; status: string };
     resumed: boolean;
     idempotency_key: string;
     ingestion_job: object;
@@ -359,6 +359,25 @@ describe("knowledge-bases create from a file", () => {
     expect(signing.filter((parts) => parts.length === 1 && parts[0] === 1)).toHaveLength(2);
     expect(clock.sleeps.some((milliseconds) => milliseconds >= 1_000 && milliseconds < 1_250)).toBe(true);
     expect(fake.storedBytes(json(result.stdout).data.upload.id).equals(FILE_BYTES)).toBe(true);
+  });
+
+  it("uploads parts again that storage rejected during assembly, with a write-only key", async () => {
+    const fake = new FakeKbDrop();
+    fake.credentials.set(MANAGEMENT_KEY, new Set(["knowledge_bases:write"]));
+    fake.rejectOnComplete = [2];
+    const path = await localFile("rejected.zip");
+
+    const result = await run(fake, ["kb", "create", "--file", path, "--json"]);
+
+    expect(result.exitCode).toBe(0);
+    const signing = fake
+      .apiRequests(/\/part-urls$/u)
+      .map((request) => (request.body as { part_numbers: number[] }).part_numbers);
+    expect(signing.at(-1)).toEqual([2]);
+    const upload = json(result.stdout).data.upload;
+    expect(upload.status).toBe("completed");
+    expect(fake.storedBytes(upload.id).equals(FILE_BYTES)).toBe(true);
+    expect(fake.knowledgeBases.size).toBe(1);
   });
 
   it("recovers a lost response and waits while the server opens and assembles the upload", async () => {

@@ -556,6 +556,18 @@ async function create(context: ManagementContext): Promise<number> {
           fetchImpl: context.fetchImpl,
           sleep: context.sleep,
           onProgress: report,
+          // Repeating the creation request returns the upload as it is now.
+          reload: async () => {
+            const replayed = await createKnowledgeBase(
+              client,
+              { idempotency_key: idempotencyKey, ...request },
+              context.sleep,
+            );
+            if (!replayed.upload) {
+              throw new CliError("output", "unexpected_response", "The kbDrop API did not return the upload.");
+            }
+            return replayed.upload;
+          },
         },
         upload,
       );
