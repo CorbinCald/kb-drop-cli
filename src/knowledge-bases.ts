@@ -320,7 +320,7 @@ async function waitForJob(
   const started = context.now();
   const deadline = started + timeoutMs;
   let job = initial;
-  let failure: unknown = null;
+  let failure: CliError | null = null;
   for (;;) {
     const waitedForMs = context.now() - started;
     if (job.terminal) return { job, settled: "terminal", waitedForMs };
@@ -332,10 +332,19 @@ async function waitForJob(
       if (failure) throw failure;
       return { job, settled: "timed_out", waitedForMs };
     }
-    const intervalSeconds = Math.min(30, Math.max(1, job.poll_after_seconds ?? 5));
+    // A refused poll says when to ask again; otherwise the job does.
+    const intervalSeconds = Math.min(
+      30,
+      Math.max(1, failure?.details.retryAfterSeconds ?? job.poll_after_seconds ?? 5),
+    );
     await context.sleep(Math.min(intervalSeconds * 1_000, remaining));
+    // No poll starts after the deadline, and each one ends by it. This loop
+    // asks again on its own schedule, so a poll makes a single attempt.
+    const budget = deadline - context.now();
+    if (budget <= 0) continue;
+    const cutoff = AbortSignal.timeout(budget);
     try {
-      job = await client.getIngestionJob(job.id);
+      job = await client.getIngestionJob(job.id, { signal: cutoff, retries: 0 });
       failure = null;
       report(ingestionEvent(job));
     } catch (error) {
@@ -345,7 +354,8 @@ async function waitForJob(
       ) {
         throw error;
       }
-      failure = error;
+      // A poll the deadline cut short ends the wait; it is not an outage.
+      if (!cutoff.aborted) failure = error;
     }
   }
 }
@@ -775,9 +785,9 @@ async function retry(context: ManagementContext): Promise<number> {
   report(ingestionEvent(job));
   const outcome = await maybeWait(client, job, context, wait, report);
   if (outcome) job = outcome.job;
-  // Once this reports how the attempt ended, running it again retries anew.
-  if (!outcome || outcome.settled === "terminal") await pending.finish();
   knowledgeBase = await client.getKnowledgeBase(id);
+  // Once this can report how the attempt ended, running it again retries anew.
+  if (!outcome || outcome.settled === "terminal") await pending.finish();
   if (context.json) {
     writeJsonSuccess(output, "knowledge-bases.retry", {
       knowledge_base: knowledgeBase,

@@ -106,6 +106,9 @@ function unexpected(): CliError {
   );
 }
 
+/** Narrows one request: `signal` ends it early, `retries` replaces the client's count. */
+export type RequestOptions = { signal?: AbortSignal; retries?: number };
+
 /**
  * The `/v1` management API. Every URL is built here from validated IDs rather
  * than followed from response links, so a response can never redirect the
@@ -123,7 +126,10 @@ export class ManagementClient {
     method: "GET" | "POST",
     path: string,
     body?: unknown,
+    options: RequestOptions = {},
   ): Promise<{ response: Response; value: unknown }> {
+    const retry =
+      options.retries === undefined ? this.retry : { ...this.retry, retries: options.retries };
     const send = (authorization: string) =>
       fetchWithRetry(
         `${this.apiUrl}${path}`,
@@ -135,8 +141,9 @@ export class ManagementClient {
             ...(body === undefined ? {} : { "Content-Type": "application/json" }),
           },
           body: body === undefined ? undefined : JSON.stringify(body),
+          signal: options.signal,
         },
-        this.retry,
+        retry,
       );
     const authorization = await this.authorize();
     let response = await send(authorization);
@@ -204,8 +211,13 @@ export class ManagementClient {
     return value;
   }
 
-  async getIngestionJob(id: string): Promise<IngestionJob> {
-    const { value } = await this.request("GET", `/v1/ingestion-jobs/${encodeURIComponent(id)}`);
+  async getIngestionJob(id: string, options?: RequestOptions): Promise<IngestionJob> {
+    const { value } = await this.request(
+      "GET",
+      `/v1/ingestion-jobs/${encodeURIComponent(id)}`,
+      undefined,
+      options,
+    );
     if (!isIngestionJob(value)) throw unexpected();
     return value;
   }

@@ -140,6 +140,15 @@ export class FakeKbDrop {
   onPut: (partNumber: number, attempt: number) => PutFault = () => undefined;
   /** Fails the create request itself, e.g. with a quota error. */
   onCreate: () => Response | undefined = () => undefined;
+  /**
+   * Intercepts any API request: a response to send instead, an error to throw
+   * as a dropped connection does, or nothing to answer it normally.
+   */
+  onRequest: (request: {
+    method: string;
+    path: string;
+    signal: AbortSignal | null;
+  }) => Response | Error | Promise<Response> | undefined = () => undefined;
 
   readonly fetch: typeof fetch = async (input, init) => {
     const url = new URL(String(input));
@@ -166,6 +175,13 @@ export class FakeKbDrop {
       body,
     });
     if (url.origin !== API_URL) throw new TypeError("fetch failed");
+    const intercepted = this.onRequest({
+      method,
+      path: url.pathname,
+      signal: init?.signal ?? null,
+    });
+    if (intercepted instanceof Error) throw intercepted;
+    if (intercepted) return intercepted;
     return this.route(method, url, headers, body);
   };
 

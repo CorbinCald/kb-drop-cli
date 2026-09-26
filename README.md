@@ -123,7 +123,7 @@ the same knowledge base, and the same key with a different request fails with
 - `create --wait`, `retry --wait`, and `recrawl --wait` wait for ingestion;
   `status --watch` does the same for an existing knowledge base. Waiting polls
   at the pace the server asks for, rides out short outages, and stops after
-  `--wait-timeout` seconds (1–86400, default 1800).
+  `--wait-timeout` seconds (1–86400, default 1800); no poll runs past that.
 - `status ID` reports the knowledge base and its latest ingestion job.
 - `list [--limit N] [--cursor CURSOR]` pages through the account's knowledge
   bases, newest first.

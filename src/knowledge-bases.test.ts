@@ -586,6 +586,53 @@ describe("knowledge-bases status, list, retry, and recrawl", () => {
     expect(watched.stderr).toContain("Embedding: ");
   });
 
+  it("never polls past --wait-timeout, even when the API refuses or stalls", async () => {
+    const fake = new FakeKbDrop();
+    const { knowledgeBaseId, jobId } = fake.addKnowledgeBase({
+      name: "Docs",
+      source: { type: "web", url: "https://docs.example.com", mode: "site" },
+      status: "crawling",
+    });
+    const jobPath = `/v1/ingestion-jobs/${jobId}`;
+    let reads = 0;
+    const watch = async (seconds: number) => {
+      const clock = new Clock();
+      reads = 0;
+      const result = await run(
+        fake,
+        ["kb", "status", knowledgeBaseId, "--watch", "--wait-timeout", String(seconds)],
+        { clock },
+      );
+      return { exitCode: result.exitCode, sleeps: clock.sleeps };
+    };
+    // The first read of the job comes before waiting; later ones are polls.
+    const polls = (answer: (signal: AbortSignal | null) => Response | Promise<Response>) => {
+      fake.onRequest = ({ path, signal }) =>
+        path === jobPath && (reads += 1) > 1 ? answer(signal) : undefined;
+    };
+
+    // A deadline shorter than the poll interval ends the wait without a poll.
+    polls(() => Response.json({}));
+    expect(await watch(1)).toEqual({ exitCode: 10, sleeps: [1_000] });
+    expect(reads).toBe(1);
+
+    // A refused poll is not retried within the request, and its Retry-After
+    // is honored only until the deadline.
+    polls(() => apiError(503, "service_unavailable", "retry_later", { "Retry-After": "30" }));
+    expect(await watch(12)).toEqual({ exitCode: 5, sleeps: [5_000, 7_000] });
+    expect(reads).toBe(2);
+
+    // A poll that hangs is abandoned at the deadline, which ends the wait.
+    polls(
+      (signal) =>
+        new Promise<Response>((_, reject) => {
+          signal!.addEventListener("abort", () => reject(signal!.reason));
+        }),
+    );
+    expect(await watch(6)).toEqual({ exitCode: 10, sleeps: [5_000, 1_000] });
+    expect(reads).toBe(2);
+  }, 15_000);
+
   it("stops watching at once when the upload is waiting on the client", async () => {
     const fake = new FakeKbDrop();
     const path = await localFile("paused.zip");
@@ -680,7 +727,7 @@ describe("knowledge-bases status, list, retry, and recrawl", () => {
     fake.jobScript = ["parsing", "failed"];
     fake.lostRetryResponses = 1;
     const clock = new Clock();
-    const argv = ["kb", "retry", knowledgeBaseId, "--wait", "--wait-timeout", "5", "--json"];
+    const argv = ["kb", "retry", knowledgeBaseId, "--wait", "--wait-timeout", "6", "--json"];
     const retryBodies = () => fake.apiRequests(/\/retry$/u).map((request) => request.body);
 
     const lost = await run(fake, [...argv, "--retries", "0"], { clock });
@@ -714,6 +761,38 @@ describe("knowledge-bases status, list, retry, and recrawl", () => {
       ingestion_job: { id: jobId, attempt: 3, status: "ready" },
     });
     expect(retryBodies().at(-1)).toEqual({ attempt: 2 });
+    expect(await pendingRecords()).toEqual([]);
+  });
+
+  it("keeps a retry's attempt until the command has reported how it ended", async () => {
+    const fake = new FakeKbDrop();
+    const { knowledgeBaseId } = fake.addKnowledgeBase({
+      name: "Flaky",
+      source: { type: "web", url: "https://docs.example.com", mode: "site" },
+      status: "failed",
+    });
+    fake.jobScript = ["parsing", "failed"];
+    let reads = 0;
+    // The connection drops on the last request, after the retried attempt failed.
+    fake.onRequest = ({ method, path }) =>
+      method === "GET" && path === `/v1/knowledge-bases/${knowledgeBaseId}` && (reads += 1) === 2
+        ? new TypeError("fetch failed")
+        : undefined;
+    const argv = ["kb", "retry", knowledgeBaseId, "--wait", "--json"];
+
+    const dropped = await run(fake, [...argv, "--retries", "0"]);
+    expect(dropped.exitCode).toBe(6);
+
+    const rerun = await run(fake, argv);
+    expect(rerun.exitCode).toBe(9);
+    expect(json(rerun.stdout).data).toMatchObject({
+      resumed: true,
+      ingestion_job: { attempt: 2, status: "failed" },
+    });
+    expect(fake.apiRequests(/\/retry$/u).map((request) => request.body)).toEqual([
+      { attempt: 1 },
+      { attempt: 1 },
+    ]);
     expect(await pendingRecords()).toEqual([]);
   });
 
