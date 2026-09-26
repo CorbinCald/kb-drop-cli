@@ -12,8 +12,14 @@ import type {
 
 const CLIENT_ID = "kb-drop-cli";
 const DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code";
-const SCOPE = "knowledge:read knowledge:query offline_access";
+// A default login can read and query. Managing knowledge bases is requested
+// only by `auth login --manage`, and the account owner approves it explicitly.
+export const QUERY_SCOPE = "knowledge:read knowledge:query offline_access";
+export const MANAGEMENT_SCOPE =
+  "knowledge:read knowledge:query knowledge_bases:read knowledge_bases:write offline_access";
+export type ManagementScope = "knowledge_bases:read" | "knowledge_bases:write";
 const API_KEY_PATTERN = /^kb_live_[A-Za-z0-9_-]{12}_[A-Za-z0-9_-]{43}$/u;
+const MANAGEMENT_KEY_PATTERN = /^kb_mgmt_[A-Za-z0-9_-]{12}_[A-Za-z0-9_-]{43}$/u;
 const ACCESS_TOKEN_PATTERN =
   /^kb_oauth_at_[A-Za-z0-9_-]{12}_[A-Za-z0-9_-]{43}$/u;
 const REFRESH_TOKEN_PATTERN =
@@ -84,6 +90,25 @@ export function environmentApiKey(
   return apiKey;
 }
 
+export function environmentManagementKey(
+  environment: NodeJS.ProcessEnv,
+): string | null {
+  const key = environment.KB_DROP_MANAGEMENT_KEY?.trim();
+  if (!key) return null;
+  if (!MANAGEMENT_KEY_PATTERN.test(key)) {
+    throw new CliError(
+      "auth",
+      "management_key_invalid",
+      "KB_DROP_MANAGEMENT_KEY does not contain a valid kbDrop management key.",
+    );
+  }
+  return key;
+}
+
+export function grantsScope(scope: string, required: string): boolean {
+  return scope.split(" ").includes(required);
+}
+
 export function normalizeApiUrl(value: string): string {
   let url: URL;
   try {
@@ -91,7 +116,8 @@ export function normalizeApiUrl(value: string): string {
   } catch {
     throw new CliError("usage", "invalid_api_url", "--api-url must be a valid URL.");
   }
-  const local = ["127.0.0.1", "::1", "localhost"].includes(url.hostname);
+  // URL keeps the brackets on an IPv6 hostname.
+  const local = ["127.0.0.1", "[::1]", "localhost"].includes(url.hostname);
   if (
     (url.protocol !== "https:" && !(url.protocol === "http:" && local)) ||
     url.username ||
@@ -365,7 +391,7 @@ async function loopbackCallback(input: {
 export async function browserLogin(
   apiUrl: string,
   dependencies: OAuthDependencies,
-  options: { openBrowser: boolean; timeoutMs: number },
+  options: { openBrowser: boolean; timeoutMs: number; scope?: string },
 ): Promise<OAuthCredential> {
   const fetchImpl = dependencies.fetchImpl ?? fetch;
   const metadata = await discoverOAuthMetadata(apiUrl, fetchImpl);
@@ -385,7 +411,7 @@ export async function browserLogin(
       redirect_uri: callback.redirectUri,
       code_challenge: challenge,
       code_challenge_method: "S256",
-      scope: SCOPE,
+      scope: options.scope ?? QUERY_SCOPE,
       state,
     }).toString();
     line(dependencies.stderr, `Open this URL to authorize kbDrop CLI:\n${authorization}`);
@@ -470,7 +496,7 @@ function deviceAuthorization(value: unknown, apiUrl: string): DeviceAuthorizatio
 export async function deviceLogin(
   apiUrl: string,
   dependencies: OAuthDependencies,
-  options: { openBrowser: boolean },
+  options: { openBrowser: boolean; scope?: string },
 ): Promise<OAuthCredential> {
   const fetchImpl = dependencies.fetchImpl ?? fetch;
   const sleep = dependencies.sleep ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
@@ -481,7 +507,7 @@ export async function deviceLogin(
     authorization = deviceAuthorization(
       await oauthPost(
         metadata.device_authorization_endpoint,
-        { client_id: CLIENT_ID, scope: SCOPE },
+        { client_id: CLIENT_ID, scope: options.scope ?? QUERY_SCOPE },
         fetchImpl,
       ),
       apiUrl,
@@ -537,37 +563,41 @@ export async function deviceLogin(
   throw new CliError("auth", "expired_token", "The device authorization expired.");
 }
 
-export async function authorizationForApi(
+type Authorization = {
+  authorization: string;
+  source: "environment" | "oauth";
+  account?: string;
+  /** When a saved login's access token stops working, in epoch milliseconds. */
+  expiresAt?: number;
+};
+
+/** A saved login is refreshed when its access token has less than this left. */
+const ACCESS_TOKEN_MARGIN_MS = 30_000;
+
+/** Returns a usable bearer for a saved login, refreshing it when it is about to expire. */
+async function oauthAuthorization(
   apiUrl: string,
+  stored: OAuthCredential,
   dependencies: Pick<OAuthDependencies, "store" | "fetchImpl" | "now">,
-  environment: NodeJS.ProcessEnv = process.env,
-): Promise<{ authorization: string; source: "environment" | "oauth"; account?: string }> {
-  const apiKey = environmentApiKey(environment);
-  if (apiKey) {
-    return { authorization: `Bearer ${apiKey}`, source: "environment" };
-  }
-  const stored = await dependencies.store.get(apiUrl);
-  if (!stored) {
-    throw new CliError(
-      "auth",
-      "login_required",
-      "Run `kb-drop auth login` or set KB_DROP_API_KEY.",
-    );
-  }
+): Promise<Authorization> {
   const now = (dependencies.now ?? Date.now)();
-  if (Date.parse(stored.accessExpiresAt) > now + 30_000) {
+  if (Date.parse(stored.accessExpiresAt) > now + ACCESS_TOKEN_MARGIN_MS) {
     return {
       authorization: `Bearer ${stored.accessToken}`,
       source: "oauth",
       account: stored.account.email,
+      expiresAt: Date.parse(stored.accessExpiresAt),
     };
   }
   if (!stored.refreshToken) {
     await dependencies.store.delete(apiUrl);
+    const login = grantsScope(stored.scope, "knowledge_bases:read")
+      ? "kb-drop auth login --manage"
+      : "kb-drop auth login";
     throw new CliError(
       "auth",
       "login_expired",
-      "The saved login expired. Run `kb-drop auth login` again.",
+      `The saved login expired. Run \`${login}\` again.`,
     );
   }
   try {
@@ -588,6 +618,7 @@ export async function authorizationForApi(
       authorization: `Bearer ${refreshed.accessToken}`,
       source: "oauth",
       account: refreshed.account.email,
+      expiresAt: Date.parse(refreshed.accessExpiresAt),
     };
   } catch (error) {
     if (error instanceof OAuthEndpointError) {
@@ -598,6 +629,100 @@ export async function authorizationForApi(
     }
     throw error;
   }
+}
+
+/**
+ * Credentials for asking and searching: KB_DROP_API_KEY, then
+ * KB_DROP_MANAGEMENT_KEY (whose `knowledge:query` scope covers every knowledge
+ * base in the account), then the saved OAuth login.
+ */
+export async function authorizationForApi(
+  apiUrl: string,
+  dependencies: Pick<OAuthDependencies, "store" | "fetchImpl" | "now">,
+  environment: NodeJS.ProcessEnv = process.env,
+): Promise<Authorization> {
+  const apiKey = environmentApiKey(environment) ?? environmentManagementKey(environment);
+  if (apiKey) {
+    return { authorization: `Bearer ${apiKey}`, source: "environment" };
+  }
+  const stored = await dependencies.store.get(apiUrl);
+  if (!stored) {
+    throw new CliError(
+      "auth",
+      "login_required",
+      "Run `kb-drop auth login` or set KB_DROP_API_KEY.",
+    );
+  }
+  return oauthAuthorization(apiUrl, stored, dependencies);
+}
+
+/**
+ * Credentials for creating and inspecting knowledge bases: KB_DROP_MANAGEMENT_KEY,
+ * then a saved OAuth login that was granted management scopes. A
+ * knowledge-base API key never qualifies, so it is not sent.
+ */
+export async function managementAuthorizationForApi(
+  apiUrl: string,
+  dependencies: Pick<OAuthDependencies, "store" | "fetchImpl" | "now">,
+  environment: NodeJS.ProcessEnv,
+  requiredScopes: readonly ManagementScope[],
+): Promise<Authorization> {
+  const key = environmentManagementKey(environment);
+  if (key) return { authorization: `Bearer ${key}`, source: "environment" };
+  const stored = await dependencies.store.get(apiUrl);
+  if (!stored) {
+    throw new CliError(
+      "auth",
+      "management_login_required",
+      "Set KB_DROP_MANAGEMENT_KEY or run `kb-drop auth login --manage`.",
+    );
+  }
+  if (!requiredScopes.every((scope) => grantsScope(stored.scope, scope))) {
+    throw new CliError(
+      "auth",
+      "management_scope_required",
+      "The saved login cannot manage knowledge bases. Run `kb-drop auth login --manage` or set KB_DROP_MANAGEMENT_KEY.",
+    );
+  }
+  return oauthAuthorization(apiUrl, stored, dependencies);
+}
+
+/**
+ * Keeps one command's management credential usable for as long as the command
+ * runs. An access token lasts 15 minutes while `--wait` can take 30, so a saved
+ * login is read and refreshed again shortly before its token expires.
+ * Concurrent requests share one refresh: kbDrop revokes the whole login when a
+ * refresh token is used twice.
+ */
+export function managementAuthorizer(
+  apiUrl: string,
+  dependencies: Pick<OAuthDependencies, "store" | "fetchImpl" | "now">,
+  environment: NodeJS.ProcessEnv,
+  requiredScopes: readonly ManagementScope[],
+): () => Promise<string> {
+  const now = dependencies.now ?? Date.now;
+  let current: Authorization | null = null;
+  let pending: Promise<Authorization> | null = null;
+  return async () => {
+    if (
+      current &&
+      (current.expiresAt === undefined ||
+        current.expiresAt > now() + ACCESS_TOKEN_MARGIN_MS)
+    ) {
+      return current.authorization;
+    }
+    pending ??= managementAuthorizationForApi(
+      apiUrl,
+      dependencies,
+      environment,
+      requiredScopes,
+    )
+      .then((authorization) => (current = authorization))
+      .finally(() => {
+        pending = null;
+      });
+    return (await pending).authorization;
+  };
 }
 
 export async function logout(

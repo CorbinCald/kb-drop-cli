@@ -93,11 +93,70 @@ function positiveRetryAfter(response: Response): number | undefined {
   return milliseconds === null ? undefined : Math.ceil(milliseconds / 1_000);
 }
 
-async function apiFailure(response: Response): Promise<CliError> {
+// What the management API tells a client to do next. Only these known values
+// are relayed; anything else in an error body is dropped.
+const RECOVERIES = new Set([
+  "ask_account_owner",
+  "authenticate",
+  "check_identifier",
+  "contact_support",
+  "create_new_knowledge_base",
+  "fix_request",
+  "request_scope",
+  "retry_later",
+  "upload_missing_parts",
+  "use_management_credential",
+  "use_new_idempotency_key",
+  "wait",
+]);
+
+// The CLI's own words for specific API failures. Server-provided text is never
+// printed, so these keep common failures actionable.
+const ERROR_MESSAGES: Record<string, string> = {
+  active_job_quota_exceeded:
+    "The account already has the maximum number of ingestion jobs running.",
+  billing_quota_exceeded: "The account's ingestion quota is used up.",
+  crawl_already_active: "This knowledge base is already being crawled.",
+  crawl_trap_url: "The URL looks like an endless calendar or search listing and cannot be crawled.",
+  empty_upload: "The file is empty.",
+  file_too_large: "The file is larger than kbDrop accepts for its type.",
+  file_type_mismatch: "The file's contents do not match its extension.",
+  idempotency_mismatch: "This idempotency key was already used for a different request.",
+  ingestion_in_progress: "The latest ingestion job is still running.",
+  ingestion_job_succeeded: "The latest ingestion job succeeded, so there is nothing to retry.",
+  ingestion_needs_support: "This failure cannot be retried.",
+  ingestion_not_retryable: "This source cannot be processed again.",
+  invalid_filename: "kbDrop does not accept this file name.",
+  invalid_management_key: "The management key is invalid, expired, or revoked.",
+  invalid_video_url: "The video URL is not supported.",
+  invalid_web_url: "The website URL is invalid.",
+  knowledge_base_not_crawlable: "Only knowledge bases created from a website can be crawled again.",
+  knowledge_base_not_found: "The knowledge base was not found.",
+  management_api_disabled: "Knowledge-base management through the API is temporarily disabled.",
+  management_credential_required: "Knowledge-base API keys cannot manage knowledge bases.",
+  management_key_scope_insufficient: "The management key does not have the permission this command needs.",
+  media_ingestion_disabled: "Audio and video ingestion is not available for this account.",
+  oauth_scope_insufficient: "The saved login does not have the permission this command needs.",
+  payment_required: "The account needs an active plan to create knowledge bases.",
+  private_web_url: "The website URL points to a private or local network address.",
+  provider_spend_quota_exceeded: "kbDrop is at its processing limit.",
+  storage_quota_exceeded: "The account's storage quota is used up.",
+  unsupported_file_type: "kbDrop does not support this file type.",
+  upload_too_large: "The file is larger than the account allows.",
+  upload_unavailable: "The upload for this request can no longer be resumed.",
+  url_credentials_not_allowed: "The website URL must not contain a user name or password.",
+  url_port_not_allowed: "The website URL must use the standard HTTP or HTTPS port.",
+  video_url_https_required: "The video URL must use HTTPS.",
+  web_url_dns_failed: "The website's domain could not be resolved.",
+  youtube_metadata_unavailable: "The video's details could not be retrieved.",
+};
+
+export async function apiFailure(response: Response): Promise<CliError> {
   let code = `http_${response.status}`;
-  const message =
+  let recovery: string | undefined;
+  let message =
     response.status === 401
-      ? "Authentication failed. Log in again or check KB_DROP_API_KEY."
+      ? "Authentication failed. Log in again or check your kbDrop credential."
       : response.status === 403
         ? "This credential is not authorized for the requested operation."
         : response.status === 404
@@ -111,7 +170,7 @@ async function apiFailure(response: Response): Promise<CliError> {
                 : "The kbDrop API rejected the request.";
   try {
     const body = (await response.json()) as {
-      error?: { code?: unknown; message?: unknown };
+      error?: { code?: unknown; recovery?: unknown };
     };
     if (
       typeof body.error?.code === "string" &&
@@ -119,11 +178,25 @@ async function apiFailure(response: Response): Promise<CliError> {
     ) {
       code = body.error.code;
     }
+    if (
+      typeof body.error?.recovery === "string" &&
+      RECOVERIES.has(body.error.recovery)
+    ) {
+      recovery = body.error.recovery;
+    }
   } catch {
     // Generic status-based text is safer than echoing an unexpected body.
   }
-  const kind =
-    response.status === 401 || response.status === 403
+  message = ERROR_MESSAGES[code] ?? message;
+  // The management API's recovery is more precise than the status: a storage
+  // quota is a 403, but no credential fixes it.
+  const kind = recovery
+    ? ["authenticate", "request_scope", "use_management_credential"].includes(recovery)
+      ? "auth"
+      : recovery === "wait" || recovery === "retry_later"
+        ? "transient"
+        : "request"
+    : response.status === 401 || response.status === 403
       ? "auth"
       : response.status === 429 || response.status >= 500
         ? "transient"
@@ -132,6 +205,7 @@ async function apiFailure(response: Response): Promise<CliError> {
     status: response.status,
     retryAfterSeconds: positiveRetryAfter(response),
     requestId: response.headers.get("x-request-id") ?? undefined,
+    recovery,
   });
 }
 
