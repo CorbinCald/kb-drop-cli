@@ -78,3 +78,84 @@ export type OAuthTokenResponse = {
   scope: string;
   account: { email: string };
 };
+
+export type IngestionFailure = {
+  stage: string;
+  recovery: string;
+  retryable: boolean;
+  message: string;
+};
+
+export type IngestionJob = {
+  object: "ingestion_job";
+  id: string;
+  knowledge_base_id: string;
+  status: string;
+  terminal: boolean;
+  attempt: number;
+  source_type: string;
+  version: number;
+  active_version: number | null;
+  queryable: boolean;
+  progress: {
+    files: { discovered: number; processed: number; skipped: number; failed: number };
+    upload: {
+      parts_total: number;
+      parts_confirmed: number;
+      bytes_total: number;
+      bytes_confirmed: number;
+    } | null;
+    crawl: {
+      pages_discovered: number;
+      pages_fetched: number;
+      pages_indexed: number;
+      pages_skipped: number;
+      pages_failed: number;
+    } | null;
+  };
+  failure: IngestionFailure | null;
+  next_action: string;
+  poll_after_seconds: number | null;
+  links: Record<string, string>;
+  [key: string]: unknown;
+};
+
+export type KnowledgeBase = {
+  object: "knowledge_base";
+  id: string;
+  name: string;
+  status: string;
+  queryable: boolean;
+  source: { type: string; [key: string]: unknown };
+  active_version: number | null;
+  latest_job: { id: string; status: string; version: number };
+  links: Record<string, string>;
+  [key: string]: unknown;
+};
+
+export type Upload = {
+  object: "upload";
+  id: string;
+  knowledge_base_id: string;
+  ingestion_job_id: string;
+  status: string;
+  size_bytes: number;
+  part_size_bytes: number;
+  part_count: number;
+  max_parts_per_request: number;
+  missing_part_numbers: number[];
+  [key: string]: unknown;
+};
+
+export type SignedPart = {
+  part_number: number;
+  size_bytes: number;
+  url: string;
+};
+
+export type KnowledgeBaseList = {
+  object: "list";
+  data: KnowledgeBase[];
+  has_more: boolean;
+  next_cursor: string | null;
+};

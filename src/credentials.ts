@@ -68,7 +68,7 @@ export class NativeCredentialStore implements CredentialStore {
       throw new CliError(
         "auth",
         "keychain_unavailable",
-        "No native OS credential store is available. Configure Keychain, Credential Manager, or Secret Service and try again.",
+        "No native OS credential store is available. Configure Keychain, Credential Manager, or Secret Service, or set KB_DROP_API_KEY or KB_DROP_MANAGEMENT_KEY.",
       );
     }
   }

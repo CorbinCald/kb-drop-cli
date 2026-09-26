@@ -18,6 +18,10 @@ export const EXIT_CODES: Record<CliErrorKind, number> = {
 };
 
 export const INSUFFICIENT_EVIDENCE_EXIT_CODE = 8;
+/** The reported ingestion job failed or was cancelled. */
+export const INGESTION_FAILED_EXIT_CODE = 9;
+/** `--wait`/`--watch` ended before ingestion reached a terminal state. */
+export const WAIT_TIMED_OUT_EXIT_CODE = 10;
 
 export class CliError extends Error {
   constructor(
@@ -28,6 +32,7 @@ export class CliError extends Error {
       status?: number;
       retryAfterSeconds?: number;
       requestId?: string;
+      recovery?: string;
     } = {},
   ) {
     super(message);

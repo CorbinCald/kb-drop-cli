@@ -770,6 +770,25 @@ describe("@kbdrop/cli", () => {
     });
   });
 
+  it("accepts HTTPS origins and plain HTTP only on this machine", async () => {
+    const accepted = async (value: string) => {
+      const stdout = capture();
+      const exitCode = await runCli(["auth", "status", "--api-url", value, "--json"], {
+        store: new MemoryStore(),
+        stdout: stdout.stream,
+        stderr: capture().stream,
+        environment: { NODE_ENV: "test" },
+      });
+      return exitCode === 0 ? JSON.parse(stdout.value()).data.api_url : exitCode;
+    };
+    expect(await accepted("https://kbdrop.io/")).toBe("https://kbdrop.io");
+    expect(await accepted("http://localhost:3000")).toBe("http://localhost:3000");
+    expect(await accepted("http://127.0.0.1:3000")).toBe("http://127.0.0.1:3000");
+    expect(await accepted("http://[::1]:3000")).toBe("http://[::1]:3000");
+    expect(await accepted("http://kbdrop.io")).toBe(2);
+    expect(await accepted("https://kbdrop.io/v1")).toBe(2);
+  });
+
   it("rejects an invalid environment key in auth status", async () => {
     const stderr = capture();
     const exitCode = await runCli(["auth", "status", "--json"], {

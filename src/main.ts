@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import type { Readable, Writable } from "node:stream";
 import { ApiClient } from "./api.js";
 import {
+  ensureAllowed,
   hasOption,
   integerOption,
   option,
@@ -18,12 +19,20 @@ import {
   INSUFFICIENT_EVIDENCE_EXIT_CODE,
 } from "./errors.js";
 import {
+  KNOWLEDGE_BASE_COMMANDS,
+  runKnowledgeBaseCommand,
+} from "./knowledge-bases.js";
+import {
   authorizationForApi,
   browserLogin,
   deviceLogin,
   environmentApiKey,
+  environmentManagementKey,
+  grantsScope,
   logout,
+  MANAGEMENT_SCOPE,
   normalizeApiUrl,
+  QUERY_SCOPE,
 } from "./oauth.js";
 import {
   writeError,
@@ -33,7 +42,7 @@ import {
   type OutputStreams,
 } from "./output.js";
 
-export const VERSION = "0.1.1";
+export const VERSION = "0.2.0";
 const DEFAULT_API_URL = "https://kbdrop.io";
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
@@ -53,12 +62,19 @@ export type CliDependencies = {
 const HELP = `kb-drop ${VERSION}
 
 Usage:
-  kb-drop auth login [--device] [--no-browser]
+  kb-drop auth login [--manage] [--device] [--no-browser]
   kb-drop auth logout
   kb-drop auth status [--json]
   kb-drop ask [question] [options]
   kb-drop search [query] [options]
+  kb-drop knowledge-bases create --file PATH|--zip PATH|--url URL|--video-url URL [options]
+  kb-drop knowledge-bases status ID [--watch]
+  kb-drop knowledge-bases list [--limit N] [--cursor CURSOR]
+  kb-drop knowledge-bases retry ID [--wait]
+  kb-drop knowledge-bases recrawl ID [--wait]
   kb-drop completion bash|zsh|fish
+
+  kb is short for knowledge-bases.
 
 Common options:
   --api-url URL              API origin (default: https://kbdrop.io)
@@ -85,9 +101,47 @@ Search controls:
   --language NAME            Repeat for language filters
   --path-prefix PATH         Restrict results to a relative path
 
+Create sources (choose one):
+  --file PATH                Upload a document, archive, audio, or video file (up to 1 GiB)
+  --zip PATH                 Upload a .zip archive
+  --url URL                  Crawl a public website
+  --video-url URL            Transcribe a public video
+
+Create controls:
+  --name NAME                Knowledge-base name, 1-120 characters
+  --wait                     Wait until ingestion finishes (status uses --watch)
+  --wait-timeout SECONDS     Stop waiting after 1-86400 seconds (default: 1800)
+  --parallel N               Upload 1-8 parts at once (default: 4)
+  --idempotency-key UUID     Use your own key instead of saved resume state
+
+Website controls (with --url):
+  --mode site|single_url     Crawl the site, or index one page (default: site)
+  --max-pages N              Stop after 1-1000 pages (default: 100)
+  --max-depth N              Follow links 0-10 levels deep (default: 3)
+  --include-path PATTERN     Crawl only matching paths, e.g. /docs/*; repeatable
+  --exclude-path PATTERN     Skip matching paths; repeatable
+  --include-subdomains       Include subdomains
+  --allow-documents          Follow linked PDFs and documents
+  --render-mode auto|always|never
+                             JavaScript rendering (default: auto)
+  --query-policy drop_tracking|strip|preserve
+                             Query strings (default: drop_tracking)
+
+Exit codes:
+  0 success, 2 usage, 3 authentication, 4 request rejected, 5 temporary
+  failure, 6 network, 7 unexpected response, 8 insufficient evidence,
+  9 ingestion failed or was cancelled, 10 stopped waiting before ingestion finished
+
+Environment:
+  KB_DROP_API_URL            Default for --api-url
+  KB_DROP_KNOWLEDGE_BASE_ID  Default knowledge base for ask and search
+  KB_DROP_STATE_DIR          Where unfinished commands keep their resume keys
+
 Authentication:
   OAuth credentials are stored in the native OS credential store.
-  KB_DROP_API_KEY takes precedence when set; secrets are never accepted as arguments.`;
+  ask and search use KB_DROP_API_KEY, then KB_DROP_MANAGEMENT_KEY, then the saved login.
+  knowledge-bases uses KB_DROP_MANAGEMENT_KEY, then a login from \`auth login --manage\`.
+  Secrets are never accepted as arguments.`;
 
 function streams(dependencies: CliDependencies): OutputStreams {
   return {
@@ -205,17 +259,18 @@ async function commandInput(
 }
 
 function completionScript(shell: string): string {
-  const commands = "auth ask search completion";
+  const commands = "auth ask search knowledge-bases kb completion";
+  const subcommands = `login logout status ${KNOWLEDGE_BASE_COMMANDS.join(" ")}`;
   const common =
-    "--help --version --json --api-url --knowledge-base --kb --input --input-file --timeout --retries";
+    "--help --version --json --api-url --knowledge-base --kb --input --input-file --timeout --retries --manage --file --zip --url --video-url --name --wait --watch --wait-timeout --parallel --limit --cursor --mode --max-pages --max-depth --include-path --exclude-path --include-subdomains --allow-documents --render-mode --query-policy";
   if (shell === "bash") {
-    return `_kb_drop_complete() {\n  local current=\"\${COMP_WORDS[COMP_CWORD]}\"\n  COMPREPLY=( $(compgen -W \"${commands} login logout status ${common}\" -- \"$current\") )\n}\ncomplete -F _kb_drop_complete kb-drop`;
+    return `_kb_drop_complete() {\n  local current=\"\${COMP_WORDS[COMP_CWORD]}\"\n  COMPREPLY=( $(compgen -W \"${commands} ${subcommands} ${common}\" -- \"$current\") )\n}\ncomplete -F _kb_drop_complete kb-drop`;
   }
   if (shell === "zsh") {
-    return `#compdef kb-drop\n_arguments '1:command:(${commands})' '*:argument:(login logout status bash zsh fish ${common})'`;
+    return `#compdef kb-drop\n_arguments '1:command:(${commands})' '*:argument:(${subcommands} bash zsh fish ${common})'`;
   }
   if (shell === "fish") {
-    return `complete -c kb-drop -f -a '${commands}'\ncomplete -c kb-drop -n '__fish_seen_subcommand_from auth' -a 'login logout status'`;
+    return `complete -c kb-drop -f -a '${commands}'\ncomplete -c kb-drop -n '__fish_seen_subcommand_from auth' -a 'login logout status'\ncomplete -c kb-drop -n '__fish_seen_subcommand_from knowledge-bases kb' -a '${KNOWLEDGE_BASE_COMMANDS.join(" ")}'`;
   }
   throw new CliError(
     "usage",
@@ -252,23 +307,6 @@ async function responseSchema(arguments_: ParsedArguments): Promise<unknown> {
       "response_schema_invalid",
       "The response schema file must contain valid JSON.",
     );
-  }
-}
-
-function ensureAllowed(
-  arguments_: ParsedArguments,
-  command: string,
-  allowed: string[],
-): void {
-  const accepted = new Set(["api-url", "help", "json", ...allowed]);
-  for (const name of arguments_.options.keys()) {
-    if (!accepted.has(name)) {
-      throw new CliError(
-        "usage",
-        "option_not_supported",
-        `--${name} is not supported by ${command}.`,
-      );
-    }
   }
 }
 
@@ -314,6 +352,31 @@ export async function runCli(
       throw new CliError("usage", "command_required", "Choose a command.");
     }
 
+    if (command === "knowledge-bases" || command === "kb") {
+      const [subcommand, ...remaining] = arguments_.positionals;
+      if (!subcommand || !KNOWLEDGE_BASE_COMMANDS.includes(subcommand)) {
+        throw new CliError(
+          "usage",
+          "knowledge_base_command_required",
+          `Use \`kb-drop knowledge-bases ${KNOWLEDGE_BASE_COMMANDS.join("|")}\`.`,
+        );
+      }
+      return await runKnowledgeBaseCommand({
+        arguments_: { ...arguments_, command: subcommand, positionals: remaining },
+        subcommand,
+        origin,
+        environment,
+        json,
+        output,
+        store,
+        fetchImpl: dependencies.fetchImpl,
+        sleep:
+          dependencies.sleep ??
+          ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))),
+        now: dependencies.now ?? Date.now,
+      });
+    }
+
     if (
       ["login", "logout", "status"].includes(command) &&
       arguments_.positionals.length > 0
@@ -339,7 +402,8 @@ export async function runCli(
     }
 
     if (command === "login") {
-      ensureAllowed(arguments_, command, ["device", "no-browser", "timeout"]);
+      ensureAllowed(arguments_, command, ["device", "manage", "no-browser", "timeout"]);
+      const scope = hasOption(arguments_, "manage") ? MANAGEMENT_SCOPE : QUERY_SCOPE;
       const timeoutMs = integerOption(arguments_, "timeout", 300_000, {
         min: 30_000,
         max: 900_000,
@@ -355,10 +419,12 @@ export async function runCli(
       const saved = hasOption(arguments_, "device")
         ? await deviceLogin(origin, loginDependencies, {
             openBrowser: !hasOption(arguments_, "no-browser"),
+            scope,
           })
         : await browserLogin(origin, loginDependencies, {
             openBrowser: !hasOption(arguments_, "no-browser"),
             timeoutMs,
+            scope,
           });
       const result = {
         api_url: origin,
@@ -368,8 +434,22 @@ export async function runCli(
           ? await store.backendName()
           : "injected",
       };
+      const canManage = grantsScope(saved.scope, "knowledge_bases:write");
+      if (hasOption(arguments_, "manage") && !canManage) {
+        throw new CliError(
+          "auth",
+          "management_scope_not_granted",
+          "The login succeeded, but knowledge-base management was not approved.",
+        );
+      }
       if (json) writeJsonSuccess(output, outputCommand, result);
-      else output.stdout.write(`Logged in to ${origin} as ${saved.account.email}.\n`);
+      else {
+        output.stdout.write(
+          `Logged in to ${origin} as ${saved.account.email}${
+            canManage ? ", with knowledge-base management" : ""
+          }.\n`,
+        );
+      }
       return 0;
     }
 
@@ -388,42 +468,45 @@ export async function runCli(
 
     if (command === "status") {
       ensureAllowed(arguments_, command, []);
-      const fromEnvironment = environmentApiKey(environment) !== null;
-      const saved = fromEnvironment ? null : await store.get(origin);
-      const result = fromEnvironment
-        ? {
-            authenticated: true,
-            source: "environment",
-            api_url: origin,
-            account: null,
-            expires_at: null,
-          }
-        : saved
-          ? {
-              authenticated:
-                Boolean(saved.refreshToken) ||
-                Date.parse(saved.accessExpiresAt) >
-                  (dependencies.now ?? Date.now)(),
-              source: "oauth",
-              api_url: origin,
-              account: saved.account.email,
-              expires_at: saved.accessExpiresAt,
-            }
-          : {
-              authenticated: false,
-              source: null,
-              api_url: origin,
-              account: null,
-              expires_at: null,
-            };
+      const apiKey = environmentApiKey(environment);
+      const managementKey = environmentManagementKey(environment);
+      // The saved login is read only when some command would fall back to it.
+      const saved = managementKey ? null : await store.get(origin);
+      const savedUsable =
+        saved !== null &&
+        (Boolean(saved.refreshToken) ||
+          Date.parse(saved.accessExpiresAt) > (dependencies.now ?? Date.now)());
+      const source = apiKey || managementKey ? "environment" : saved ? "oauth" : null;
+      const result = {
+        authenticated: source === "environment" || savedUsable,
+        source,
+        api_url: origin,
+        account: source === "oauth" ? saved!.account.email : null,
+        expires_at: source === "oauth" ? saved!.accessExpiresAt : null,
+        // Which credential `knowledge-bases` commands use, if any.
+        management: managementKey
+          ? "environment"
+          : savedUsable && grantsScope(saved!.scope, "knowledge_bases:write")
+            ? "oauth"
+            : null,
+      };
       if (json) writeJsonSuccess(output, outputCommand, result);
-      else if (result.authenticated) {
+      else {
         output.stdout.write(
-          result.source === "environment"
-            ? `Authenticated to ${origin} with KB_DROP_API_KEY.\n`
-            : `Logged in to ${origin} as ${result.account}.\n`,
+          !result.authenticated
+            ? `Not logged in to ${origin}.\n`
+            : source === "environment"
+              ? `Authenticated to ${origin} with ${apiKey ? "KB_DROP_API_KEY" : "KB_DROP_MANAGEMENT_KEY"}.\n`
+              : `Logged in to ${origin} as ${result.account}.\n`,
         );
-      } else output.stdout.write(`Not logged in to ${origin}.\n`);
+        output.stdout.write(
+          result.management === "environment"
+            ? "Knowledge-base management: KB_DROP_MANAGEMENT_KEY.\n"
+            : result.management === "oauth"
+              ? "Knowledge-base management: allowed by the saved login.\n"
+              : "Knowledge-base management: not set up. Run `kb-drop auth login --manage` or set KB_DROP_MANAGEMENT_KEY.\n",
+        );
+      }
       return 0;
     }
 

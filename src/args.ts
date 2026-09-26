@@ -1,33 +1,63 @@
 import { CliError } from "./errors.js";
 
 const BOOLEAN_OPTIONS = new Set([
+  "allow-documents",
   "device",
   "help",
   "include-excerpts",
   "include-latency",
+  "include-subdomains",
   "include-usage",
   "json",
+  "manage",
   "no-browser",
   "stream-compat",
   "version",
+  "wait",
+  "watch",
 ]);
 const VALUE_OPTIONS = new Set([
   "api-url",
   "citation-detail",
   "conversation",
+  "cursor",
+  "exclude-path",
+  "file",
   "idempotency-key",
+  "include-path",
   "input",
   "input-file",
   "kb",
   "knowledge-base",
   "language",
+  "limit",
   "max-answer-tokens",
+  "max-depth",
+  "max-pages",
+  "mode",
+  "name",
+  "parallel",
   "path-prefix",
   "query",
+  "query-policy",
+  "render-mode",
   "response-schema",
   "retries",
   "timeout",
   "top-k",
+  "url",
+  "video-url",
+  "wait-timeout",
+  "zip",
+]);
+const REPEATABLE_OPTIONS = new Set(["exclude-path", "include-path", "language"]);
+// Rejected by name so a secret never reaches shell history or process lists.
+const SECRET_OPTIONS = new Set([
+  "access-token",
+  "api-key",
+  "key",
+  "management-key",
+  "token",
 ]);
 
 export type ParsedArguments = {
@@ -56,13 +86,15 @@ export function parseArguments(argv: string[]): ParsedArguments {
       continue;
     }
     if (!positionalOnly && argument.startsWith("--")) {
-      const [rawName, inlineValue] = argument.slice(2).split("=", 2);
-      const name = rawName ?? "";
-      if (name === "api-key") {
+      // Split at the first "=" only: URLs and paths may contain more.
+      const separator = argument.indexOf("=");
+      const name = separator === -1 ? argument.slice(2) : argument.slice(2, separator);
+      const inlineValue = separator === -1 ? undefined : argument.slice(separator + 1);
+      if (SECRET_OPTIONS.has(name)) {
         throw new CliError(
           "usage",
           "secret_argument_forbidden",
-          "Do not pass secrets on the command line. Use OAuth login or KB_DROP_API_KEY.",
+          "Do not pass secrets on the command line. Use OAuth login, KB_DROP_API_KEY, or KB_DROP_MANAGEMENT_KEY.",
         );
       }
       if (BOOLEAN_OPTIONS.has(name)) {
@@ -106,7 +138,7 @@ export function option(
   name: string,
 ): string | undefined {
   const values = arguments_.options.get(name);
-  if ((values?.length ?? 0) > 1 && name !== "language") {
+  if ((values?.length ?? 0) > 1 && !REPEATABLE_OPTIONS.has(name)) {
     throw new CliError(
       "usage",
       "duplicate_option",
@@ -137,4 +169,22 @@ export function integerOption(
     );
   }
   return value;
+}
+
+/** Rejects options the command does not use, so a typo never goes unnoticed. */
+export function ensureAllowed(
+  arguments_: ParsedArguments,
+  command: string,
+  allowed: string[],
+): void {
+  const accepted = new Set(["api-url", "help", "json", ...allowed]);
+  for (const name of arguments_.options.keys()) {
+    if (!accepted.has(name)) {
+      throw new CliError(
+        "usage",
+        "option_not_supported",
+        `--${name} is not supported by ${command}.`,
+      );
+    }
+  }
 }
