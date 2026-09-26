@@ -471,7 +471,15 @@ export async function runCli(
       const apiKey = environmentApiKey(environment);
       const managementKey = environmentManagementKey(environment);
       // The saved login is read only when some command would fall back to it.
-      const saved = managementKey ? null : await store.get(origin);
+      // Without an OS keychain, KB_DROP_API_KEY still authenticates.
+      const saved = managementKey
+        ? null
+        : await store.get(origin).catch((error: unknown) => {
+            if (apiKey && error instanceof CliError && error.code === "keychain_unavailable") {
+              return null;
+            }
+            throw error;
+          });
       const savedUsable =
         saved !== null &&
         (Boolean(saved.refreshToken) ||

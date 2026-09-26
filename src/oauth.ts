@@ -556,7 +556,12 @@ type Authorization = {
   authorization: string;
   source: "environment" | "oauth";
   account?: string;
+  /** When a saved login's access token stops working, in epoch milliseconds. */
+  expiresAt?: number;
 };
+
+/** A saved login is refreshed when its access token has less than this left. */
+const ACCESS_TOKEN_MARGIN_MS = 30_000;
 
 /** Returns a usable bearer for a saved login, refreshing it when it is about to expire. */
 async function oauthAuthorization(
@@ -565,11 +570,12 @@ async function oauthAuthorization(
   dependencies: Pick<OAuthDependencies, "store" | "fetchImpl" | "now">,
 ): Promise<Authorization> {
   const now = (dependencies.now ?? Date.now)();
-  if (Date.parse(stored.accessExpiresAt) > now + 30_000) {
+  if (Date.parse(stored.accessExpiresAt) > now + ACCESS_TOKEN_MARGIN_MS) {
     return {
       authorization: `Bearer ${stored.accessToken}`,
       source: "oauth",
       account: stored.account.email,
+      expiresAt: Date.parse(stored.accessExpiresAt),
     };
   }
   if (!stored.refreshToken) {
@@ -601,6 +607,7 @@ async function oauthAuthorization(
       authorization: `Bearer ${refreshed.accessToken}`,
       source: "oauth",
       account: refreshed.account.email,
+      expiresAt: Date.parse(refreshed.accessExpiresAt),
     };
   } catch (error) {
     if (error instanceof OAuthEndpointError) {
@@ -667,6 +674,44 @@ export async function managementAuthorizationForApi(
     );
   }
   return oauthAuthorization(apiUrl, stored, dependencies);
+}
+
+/**
+ * Keeps one command's management credential usable for as long as the command
+ * runs. An access token lasts 15 minutes while `--wait` can take 30, so a saved
+ * login is read and refreshed again shortly before its token expires.
+ * Concurrent requests share one refresh: kbDrop revokes the whole login when a
+ * refresh token is used twice.
+ */
+export function managementAuthorizer(
+  apiUrl: string,
+  dependencies: Pick<OAuthDependencies, "store" | "fetchImpl" | "now">,
+  environment: NodeJS.ProcessEnv,
+  requiredScopes: readonly ManagementScope[],
+): () => Promise<string> {
+  const now = dependencies.now ?? Date.now;
+  let current: Authorization | null = null;
+  let pending: Promise<Authorization> | null = null;
+  return async () => {
+    if (
+      current &&
+      (current.expiresAt === undefined ||
+        current.expiresAt > now() + ACCESS_TOKEN_MARGIN_MS)
+    ) {
+      return current.authorization;
+    }
+    pending ??= managementAuthorizationForApi(
+      apiUrl,
+      dependencies,
+      environment,
+      requiredScopes,
+    )
+      .then((authorization) => (current = authorization))
+      .finally(() => {
+        pending = null;
+      });
+    return (await pending).authorization;
+  };
 }
 
 export async function logout(

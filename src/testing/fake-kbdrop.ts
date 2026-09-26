@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { OAuthCredential } from "../types.js";
 
 /**
  * An in-memory kbDrop management API and object store, served through
@@ -110,6 +111,17 @@ export class FakeKbDrop {
   ]);
   /** Statuses a job moves through after its source is in place. */
   jobScript: string[] = ["parsing", "embedding", "ready"];
+  /** The poll interval a running job advertises. */
+  pollAfterSeconds = 5;
+  /** The time OAuth access tokens are checked against; tests share the CLI's clock. */
+  now: () => number = Date.now;
+  /** How long access tokens issued by a refresh last. */
+  accessTokenSeconds = 900;
+  /** Refresh grants answered: "issued", or "replayed" when a used token revoked the login. */
+  readonly refreshGrants: Array<"issued" | "replayed" | "invalid"> = [];
+  private readonly accessTokens = new Map<string, { scopes: Set<string>; expiresAt: number }>();
+  private readonly refreshTokens = new Map<string, { scope: string; email: string; used: boolean }>();
+  private issuedTokens = 0;
   jobFailure: Failure = {
     stage: "parsing",
     recovery: "retry",
@@ -139,6 +151,9 @@ export class FakeKbDrop {
         body: undefined,
       });
       return this.put(url, init);
+    }
+    if (url.origin === API_URL && url.pathname === "/oauth/token") {
+      return this.token(new URLSearchParams(String(init?.body ?? "")));
     }
     if (typeof init?.body === "string") body = JSON.parse(init.body);
     this.requests.push({
@@ -172,6 +187,65 @@ export class FakeKbDrop {
     for (let signature = 1; signature <= this.signatures; signature += 1) {
       this.expiredSignatures.add(String(signature));
     }
+  }
+
+  /**
+   * Issues the tokens `auth login --manage` saves. Each refresh token works
+   * once; presenting a used one revokes the whole login, as kbDrop does.
+   */
+  savedLogin(input: { scope: string; expiresInSeconds: number }): OAuthCredential {
+    const token = this.issueTokens(input.scope, "owner@example.com", input.expiresInSeconds);
+    return {
+      version: 1,
+      apiUrl: API_URL,
+      accessToken: token.access_token,
+      accessExpiresAt: new Date(this.now() + token.expires_in * 1_000).toISOString(),
+      refreshToken: token.refresh_token,
+      scope: token.scope,
+      account: token.account,
+    };
+  }
+
+  private issueTokens(scope: string, email: string, expiresInSeconds: number) {
+    this.issuedTokens += 1;
+    const serial = String(this.issuedTokens).padStart(12, "0");
+    const accessToken = `kb_oauth_at_${serial}_${"a".repeat(43)}`;
+    const refreshToken = `kb_oauth_rt_${serial}_${"r".repeat(43)}`;
+    this.accessTokens.set(accessToken, {
+      scopes: new Set(scope.split(" ")),
+      expiresAt: this.now() + expiresInSeconds * 1_000,
+    });
+    this.refreshTokens.set(refreshToken, { scope, email, used: false });
+    return {
+      access_token: accessToken,
+      token_type: "Bearer",
+      expires_in: expiresInSeconds,
+      refresh_token: refreshToken,
+      scope,
+      account: { email },
+    };
+  }
+
+  private async token(form: URLSearchParams): Promise<Response> {
+    // A refresh takes a network round trip, so concurrent callers overlap it.
+    await yieldToEventLoop();
+    const grant =
+      form.get("grant_type") === "refresh_token"
+        ? this.refreshTokens.get(form.get("refresh_token") ?? "")
+        : undefined;
+    if (!grant) {
+      this.refreshGrants.push("invalid");
+      return Response.json({ error: "invalid_grant" }, { status: 400 });
+    }
+    if (grant.used) {
+      this.refreshGrants.push("replayed");
+      this.accessTokens.clear();
+      this.refreshTokens.clear();
+      return Response.json({ error: "invalid_grant" }, { status: 400 });
+    }
+    grant.used = true;
+    this.refreshGrants.push("issued");
+    return Response.json(this.issueTokens(grant.scope, grant.email, this.accessTokenSeconds));
   }
 
   /** Closes an upload, as the idle sweeper does after an abandoned client. */
@@ -228,7 +302,9 @@ export class FakeKbDrop {
 
   private authorize(headers: Headers, scope: string): Response | null {
     const token = headers.get("authorization")?.replace(/^Bearer /u, "") ?? "";
-    const scopes = this.credentials.get(token);
+    const login = this.accessTokens.get(token);
+    if (login && login.expiresAt <= this.now()) return apiError(401, "invalid_token", "authenticate");
+    const scopes = this.credentials.get(token) ?? login?.scopes;
     if (!scopes) return apiError(401, "invalid_management_credential", "authenticate");
     if (!scopes.has(scope)) {
       return apiError(403, "management_key_scope_insufficient", "request_scope");
@@ -265,7 +341,7 @@ export class FakeKbDrop {
     const knowledgeBase = this.knowledgeBases.get(job.knowledgeBaseId)!;
     const terminal = ["ready", "failed", "cancelled"].includes(job.status);
     let nextAction = "wait";
-    let poll: number | null = 5;
+    let poll: number | null = this.pollAfterSeconds;
     if (job.status === "ready" || job.status === "cancelled") {
       nextAction = "none";
       poll = null;

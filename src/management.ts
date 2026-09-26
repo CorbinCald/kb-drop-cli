@@ -112,9 +112,10 @@ function unexpected(): CliError {
  * credential to another origin.
  */
 export class ManagementClient {
+  /** `authorize` returns the current `Authorization` header value. */
   constructor(
     private readonly apiUrl: string,
-    private readonly authorization: string,
+    private readonly authorize: () => Promise<string>,
     private readonly retry: RetryOptions,
   ) {}
 
@@ -123,19 +124,32 @@ export class ManagementClient {
     path: string,
     body?: unknown,
   ): Promise<{ response: Response; value: unknown }> {
-    const response = await fetchWithRetry(
-      `${this.apiUrl}${path}`,
-      {
-        method,
-        headers: {
-          Accept: "application/json",
-          Authorization: this.authorization,
-          ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+    const send = (authorization: string) =>
+      fetchWithRetry(
+        `${this.apiUrl}${path}`,
+        {
+          method,
+          headers: {
+            Accept: "application/json",
+            Authorization: authorization,
+            ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+          },
+          body: body === undefined ? undefined : JSON.stringify(body),
         },
-        body: body === undefined ? undefined : JSON.stringify(body),
-      },
-      this.retry,
-    );
+        this.retry,
+      );
+    const authorization = await this.authorize();
+    let response = await send(authorization);
+    if (response.status === 401) {
+      // A token can expire while a request waits out retries. kbDrop refuses
+      // an expired token before doing anything, so the request is sent again
+      // once, and only when the login has since been refreshed.
+      const renewed = await this.authorize();
+      if (renewed !== authorization) {
+        await response.body?.cancel().catch(() => undefined);
+        response = await send(renewed);
+      }
+    }
     if (!response.ok) throw await apiFailure(response);
     const value: unknown = await response.json().catch(() => undefined);
     if (value === undefined) {

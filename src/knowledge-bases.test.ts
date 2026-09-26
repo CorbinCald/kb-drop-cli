@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseArguments } from "./args.js";
 import type { CredentialStore } from "./credentials.js";
+import { CliError } from "./errors.js";
 import { runCli } from "./main.js";
 import {
   API_URL,
@@ -856,6 +857,123 @@ describe("management credentials", () => {
       environment: { NODE_ENV: "test", KB_DROP_API_URL: API_URL },
     });
     expect(json(none.stdout).data).toMatchObject({ authenticated: false, management: null });
+  });
+});
+
+describe("long-running commands on a saved login", () => {
+  // No KB_DROP_MANAGEMENT_KEY, so management commands use the saved login.
+  const loginEnvironment = (): NodeJS.ProcessEnv => ({
+    NODE_ENV: "test",
+    KB_DROP_API_URL: API_URL,
+    KB_DROP_STATE_DIR: stateDirectory,
+  });
+
+  function managedLogin(fake: FakeKbDrop, clock: Clock, expiresInSeconds: number): MemoryStore {
+    fake.now = () => clock.now;
+    const store = new MemoryStore();
+    store.value = fake.savedLogin({ scope: MANAGEMENT_SCOPES, expiresInSeconds });
+    return store;
+  }
+
+  it("refreshes the login when a wait outlasts its access token", async () => {
+    const fake = new FakeKbDrop();
+    const clock = new Clock();
+    const store = managedLogin(fake, clock, 900);
+    const first = store.value!.accessToken;
+    // About 20 minutes of ingestion against a 15-minute access token.
+    fake.pollAfterSeconds = 30;
+    fake.jobScript = [...Array<string>(40).fill("embedding"), "ready"];
+
+    const result = await run(
+      fake,
+      ["kb", "create", "--url", "https://docs.example.com", "--wait", "--json"],
+      { store, clock, environment: loginEnvironment() },
+    );
+
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(fake.refreshGrants).toEqual(["issued"]);
+    const bearers = new Set(fake.apiRequests().map((request) => request.authorization));
+    expect([...bearers]).toEqual([`Bearer ${first}`, `Bearer ${store.value!.accessToken}`]);
+  });
+
+  it("refreshes once for parallel parts that need a new login at the same moment", async () => {
+    const fake = new FakeKbDrop();
+    const clock = new Clock();
+    const store = managedLogin(fake, clock, 900);
+    const expiresAt = Date.parse(store.value!.accessExpiresAt);
+    // Every part's first PUT stalls until both its signature and the login expire.
+    fake.onPut = (_partNumber, attempt) => {
+      if (attempt > 1) return undefined;
+      clock.now = Math.max(clock.now, expiresAt);
+      return new Response(null, { status: 403 });
+    };
+    const file = await localFile("notes.pdf");
+
+    const result = await run(fake, ["kb", "create", "--file", file, "--parallel", "4", "--json"], {
+      store,
+      clock,
+      environment: loginEnvironment(),
+    });
+
+    expect(result.exitCode, result.stderr).toBe(0);
+    // A second refresh would reuse the first refresh token and revoke the login.
+    expect(fake.refreshGrants).toEqual(["issued"]);
+    expect(fake.storedBytes(json(result.stdout).data.upload.id)).toEqual(FILE_BYTES);
+  });
+
+  it("sends a request again when its token expired while it waited out a retry", async () => {
+    const fake = new FakeKbDrop();
+    const clock = new Clock();
+    const store = managedLogin(fake, clock, 45);
+    const first = store.value!.accessToken;
+    let creates = 0;
+    fake.onCreate = () =>
+      (creates += 1) <= 2
+        ? apiError(503, "service_unavailable", "retry_later", { "Retry-After": "30" })
+        : undefined;
+
+    const result = await run(fake, ["kb", "create", "--url", "https://docs.example.com", "--json"], {
+      store,
+      clock,
+      environment: loginEnvironment(),
+    });
+
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(fake.refreshGrants).toEqual(["issued"]);
+    expect(
+      fake.apiRequests(/^\/v1\/knowledge-bases$/u).map((request) => request.authorization),
+    ).toEqual([
+      `Bearer ${first}`,
+      `Bearer ${first}`,
+      `Bearer ${first}`,
+      `Bearer ${store.value!.accessToken}`,
+    ]);
+  });
+
+  it("reports KB_DROP_API_KEY from auth status when no OS keychain is available", async () => {
+    const fake = new FakeKbDrop();
+    const unavailable = async (): Promise<never> => {
+      throw new CliError("auth", "keychain_unavailable", "No native OS credential store is available.");
+    };
+    const noKeychain: CredentialStore = { get: unavailable, set: unavailable, delete: unavailable };
+
+    const withKey = await run(fake, ["auth", "status", "--json"], {
+      store: noKeychain,
+      environment: { NODE_ENV: "test", KB_DROP_API_URL: API_URL, KB_DROP_API_KEY: apiKey },
+    });
+    expect(withKey.exitCode, withKey.stderr).toBe(0);
+    expect(json(withKey.stdout).data).toMatchObject({
+      authenticated: true,
+      source: "environment",
+      management: null,
+    });
+
+    const withoutKey = await run(fake, ["auth", "status", "--json"], {
+      store: noKeychain,
+      environment: { NODE_ENV: "test", KB_DROP_API_URL: API_URL },
+    });
+    expect(withoutKey.exitCode).toBe(3);
+    expect(json(withoutKey.stderr).error.code).toBe("keychain_unavailable");
   });
 });
 

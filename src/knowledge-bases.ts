@@ -18,7 +18,7 @@ import {
   type CreateKnowledgeBaseBody,
   type CreatedKnowledgeBase,
 } from "./management.js";
-import { managementAuthorizationForApi, type ManagementScope } from "./oauth.js";
+import { managementAuthorizer, type ManagementScope } from "./oauth.js";
 import {
   describeIngestion,
   formatBytes,
@@ -284,13 +284,15 @@ async function managementClient(
     fetchImpl: context.fetchImpl,
     sleep: context.sleep,
   };
-  const auth = await managementAuthorizationForApi(
+  const authorize = managementAuthorizer(
     context.origin,
     { store: context.store, fetchImpl: context.fetchImpl, now: context.now },
     context.environment,
     scopes,
   );
-  return new ManagementClient(context.origin, auth.authorization, retry);
+  // A missing or unusable credential fails here, before any work starts.
+  await authorize();
+  return new ManagementClient(context.origin, authorize, retry);
 }
 
 function ingestionEvent(job: IngestionJob): ProgressEvent {
