@@ -27,6 +27,8 @@ type Job = {
   failure: Failure | null;
   files: { discovered: number; processed: number; skipped: number; failed: number };
   uploadId: string | null;
+  /** The review a paused job waits on, as the API serializes it. */
+  review?: Record<string, unknown> | null;
 };
 
 type KnowledgeBaseRecord = {
@@ -126,6 +128,29 @@ export class FakeKbDrop {
     recovery: "retry",
     message: "The parser stopped unexpectedly.",
   };
+  /** The review a job reaching "reviewing" in its script waits on. */
+  review: Record<string, unknown> = {
+    paused_at: "2026-09-24T12:00:00.000Z",
+    exports: [
+      {
+        key: "slack.workspace.0123456789abcdef",
+        app: "slack",
+        record_unit: "conversation_day",
+        reasons: ["private"],
+        records: 12,
+        private: {
+          kinds: [{ kind: "direct_message", count: 2 }],
+          records: 3,
+          available: true,
+        },
+        link_base: null,
+        too_large: null,
+        partitions: [{ id: "00112233445566aa", label: "#incidents", records: 9, bytes: 2048 }],
+      },
+    ],
+  };
+  /** Answers to a review that are applied but lost on the way back. */
+  lostReviewResponses = 0;
   /** Replays of a create answer 202 this many times while the upload is being opened. */
   initializingReplies = 0;
   /** Creates this many knowledge bases but loses the response, as a dropped connection does. */
@@ -372,6 +397,9 @@ export class FakeKbDrop {
             ? "create_new_knowledge_base"
             : "contact_support";
       poll = null;
+    } else if (job.status === "reviewing") {
+      nextAction = "review";
+      poll = null;
     } else if (job.status === "uploading") {
       if (upload?.status === "uploading") {
         nextAction = upload.confirmed.size < upload.partCount ? "upload_parts" : "complete_upload";
@@ -419,6 +447,7 @@ export class FakeKbDrop {
           : null,
       next_action: nextAction,
       poll_after_seconds: poll,
+      review: job.status === "reviewing" ? (job.review ?? this.review) : null,
       links: { self: `${API_URL}/v1/ingestion-jobs/${job.id}` },
     };
   }
@@ -456,6 +485,8 @@ export class FakeKbDrop {
   }
 
   private advance(job: Job): void {
+    // A paused upload waits for its owner, however often it is polled.
+    if (job.status === "reviewing") return;
     const next = job.script.shift();
     if (!next) return;
     job.status = next;
@@ -688,6 +719,27 @@ export class FakeKbDrop {
       job.script = [...this.jobScript];
       if (this.lostRetryResponses > 0) {
         this.lostRetryResponses -= 1;
+        throw new TypeError("fetch failed");
+      }
+      return Response.json(this.serializeJob(job), { status: 202 });
+    }
+
+    match = /^\/v1\/ingestion-jobs\/([^/]+)\/review$/u.exec(path);
+    if (method === "POST" && match) {
+      const denied = this.authorize(headers, "knowledge_bases:write");
+      if (denied) return denied;
+      const job = this.jobs.get(match[1]!);
+      if (!job) return apiError(404, "ingestion_job_not_found", "check_identifier");
+      if (job.status !== "reviewing") return apiError(409, "review_not_pending", "fix_request");
+      job.review = null;
+      if (input.decision === "cancel") {
+        job.status = "cancelled";
+        job.script = [];
+        return Response.json(this.serializeJob(job));
+      }
+      job.status = "queued";
+      if (this.lostReviewResponses > 0) {
+        this.lostReviewResponses -= 1;
         throw new TypeError("fetch failed");
       }
       return Response.json(this.serializeJob(job), { status: 202 });

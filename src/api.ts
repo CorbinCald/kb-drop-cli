@@ -126,20 +126,28 @@ const ERROR_MESSAGES: Record<string, string> = {
   ingestion_job_succeeded: "The latest ingestion job succeeded, so there is nothing to retry.",
   ingestion_needs_support: "This failure cannot be retried.",
   ingestion_not_retryable: "This source cannot be processed again.",
+  interface_over_capacity:
+    "More knowledge bases are plugged into this interface than one question can search. Unplug some on the switchboard, or pass --knowledge-base.",
   invalid_filename: "kbDrop does not accept this file name.",
   invalid_management_key: "The management key is invalid, expired, or revoked.",
+  invalid_review_choices:
+    "The review choices were refused. Check the dates, and that --datadog-site is a Datadog site and --grafana-url an HTTPS Grafana address.",
   invalid_video_url: "The video URL is not supported.",
   invalid_web_url: "The website URL is invalid.",
   knowledge_base_not_crawlable: "Only knowledge bases created from a website can be crawled again.",
   knowledge_base_not_found: "The knowledge base was not found.",
+  knowledge_bases_not_ready: "None of the plugged-in knowledge bases is ready to answer yet.",
   management_api_disabled: "Knowledge-base management through the API is temporarily disabled.",
   management_credential_required: "Knowledge-base API keys cannot manage knowledge bases.",
   management_key_scope_insufficient: "The management key does not have the permission this command needs.",
   media_ingestion_disabled: "Audio and video ingestion is not available for this account.",
+  no_knowledge_bases_connected:
+    "No knowledge bases are plugged into this interface. Plug one in on the switchboard, or pass --knowledge-base.",
   oauth_scope_insufficient: "The saved login does not have the permission this command needs.",
   payment_required: "The account needs an active plan to create knowledge bases.",
   private_web_url: "The website URL points to a private or local network address.",
   provider_spend_quota_exceeded: "kbDrop is at its processing limit.",
+  review_not_pending: "The upload isn't waiting for a review.",
   storage_quota_exceeded: "The account's storage quota is used up.",
   unsupported_file_type: "kbDrop does not support this file type.",
   upload_too_large: "The file is larger than the account allows.",
@@ -209,6 +217,22 @@ export async function apiFailure(response: Response): Promise<CliError> {
   });
 }
 
+/**
+ * Without a knowledge base, a question or search goes to the credential's
+ * interface. A server whose switchboard isn't on yet has no such route, so
+ * its 404 asks for a knowledge base, as the CLI did before interfaces.
+ */
+async function interfaceFailure(response: Response): Promise<CliError> {
+  const failure = await apiFailure(response);
+  if (response.status !== 404 || failure.code !== "not_found") return failure;
+  return new CliError(
+    "usage",
+    "knowledge_base_required",
+    "Provide --knowledge-base/--kb or set KB_DROP_KNOWLEDGE_BASE_ID.",
+    failure.details,
+  );
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -248,7 +272,8 @@ function isAskCompletion(value: unknown): value is AskCompletion {
     typeof value.request_id === "string" &&
     typeof value.operation_id === "string" &&
     typeof value.conversation_id === "string" &&
-    typeof value.knowledge_base_id === "string" &&
+    (typeof value.knowledge_base_id === "string" ||
+      value.knowledge_base_id === null) &&
     (typeof value.answer_model === "string" || value.answer_model === null) &&
     Array.isArray(value.citations) &&
     value.citations.every(isCitation) &&
@@ -332,8 +357,12 @@ export class ApiClient {
     private readonly retry: RetryOptions,
   ) {}
 
+  /**
+   * Without a knowledge base, the question goes to the credential's interface,
+   * which answers from every knowledge base plugged into it.
+   */
   async ask(
-    knowledgeBaseId: string,
+    knowledgeBaseId: string | null,
     input: string,
     options: AskOptions = {},
   ): Promise<AskCompletion> {
@@ -365,7 +394,9 @@ export class ApiClient {
         : {}),
     };
     const response = await fetchWithRetry(
-      `${this.apiUrl}/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/messages`,
+      knowledgeBaseId
+        ? `${this.apiUrl}/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/messages`
+        : `${this.apiUrl}/v1/messages`,
       {
         method: "POST",
         headers: {
@@ -377,7 +408,9 @@ export class ApiClient {
       },
       this.retry,
     );
-    if (!response.ok) throw await apiFailure(response);
+    if (!response.ok) {
+      throw knowledgeBaseId ? await apiFailure(response) : await interfaceFailure(response);
+    }
     if (stream) return parseSse(response, options.onDelta);
     let value: unknown;
     try {
@@ -400,7 +433,7 @@ export class ApiClient {
   }
 
   async search(
-    knowledgeBaseId: string,
+    knowledgeBaseId: string | null,
     input: {
       query: string;
       topK: number;
@@ -409,7 +442,9 @@ export class ApiClient {
     },
   ): Promise<SearchResponse> {
     const response = await fetchWithRetry(
-      `${this.apiUrl}/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/search`,
+      knowledgeBaseId
+        ? `${this.apiUrl}/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/search`
+        : `${this.apiUrl}/v1/search`,
       {
         method: "POST",
         headers: {
@@ -436,7 +471,9 @@ export class ApiClient {
       },
       this.retry,
     );
-    if (!response.ok) throw await apiFailure(response);
+    if (!response.ok) {
+      throw knowledgeBaseId ? await apiFailure(response) : await interfaceFailure(response);
+    }
     const value = (await response.json().catch(() => null)) as SearchResponse | null;
     if (!value || !Array.isArray(value.results) || typeof value.request_id !== "string") {
       throw new CliError(

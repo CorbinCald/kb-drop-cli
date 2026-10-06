@@ -17,6 +17,21 @@ export type CreateKnowledgeBaseBody = {
   source: Record<string, unknown> & { type: "upload" | "web" | "video_url" };
 };
 
+/** What an app export keeps, the same for every export in the upload. */
+export type ExportChoiceBody = {
+  include_private: boolean;
+  since?: string;
+  until?: string;
+};
+
+export type ReviewAnswerBody =
+  | {
+      decision: "index";
+      exports: Record<string, ExportChoiceBody>;
+      link_bases: { datadog?: string; grafana?: string };
+    }
+  | { decision: "cancel" };
+
 export type CreatedKnowledgeBase = {
   /** 201 created, 200 replayed, or 202 while another request opens the upload. */
   status: number;
@@ -237,6 +252,21 @@ export class ManagementClient {
       replayed: response.headers.get("x-idempotent-replay") === "true",
       job: value,
     };
+  }
+
+  /**
+   * Answers the review a paused upload waits on. A second answer is refused
+   * with `review_not_pending`, so this makes a single attempt.
+   */
+  async answerIngestionReview(id: string, body: ReviewAnswerBody): Promise<IngestionJob> {
+    const { value } = await this.request(
+      "POST",
+      `/v1/ingestion-jobs/${encodeURIComponent(id)}/review`,
+      body,
+      { retries: 0 },
+    );
+    if (!isIngestionJob(value)) throw unexpected();
+    return value;
   }
 
   /** Crawls a website knowledge base again; the key makes a repeat a replay. */

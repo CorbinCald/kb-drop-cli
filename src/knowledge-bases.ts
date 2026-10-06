@@ -17,6 +17,7 @@ import {
   UUID_PATTERN,
   type CreateKnowledgeBaseBody,
   type CreatedKnowledgeBase,
+  type ReviewAnswerBody,
 } from "./management.js";
 import { managementAuthorizer, type ManagementScope } from "./oauth.js";
 import {
@@ -37,7 +38,7 @@ import {
   type LocalFile,
 } from "./uploads.js";
 
-export const KNOWLEDGE_BASE_COMMANDS = ["create", "list", "status", "retry", "recrawl"];
+export const KNOWLEDGE_BASE_COMMANDS = ["create", "list", "status", "retry", "recrawl", "review"];
 
 export type ManagementContext = {
   /** Arguments after the subcommand. */
@@ -78,10 +79,20 @@ const WEB_OPTIONS = [
   "query-policy",
   "render-mode",
 ];
+/** What an upload of app exports keeps, given up front so it never pauses for a review. */
+const APP_DATA_OPTIONS = [
+  "datadog-site",
+  "grafana-url",
+  "include-private",
+  "since",
+  "skip-review",
+  "until",
+];
+const MAX_LINK_BASE_LENGTH = 512;
 const REQUEST_OPTIONS = ["retries", "timeout"];
 const TARGET_OPTIONS = ["kb", "knowledge-base"];
-/** Next actions the server waits on the client for; polling cannot change them. */
-const CLIENT_ACTIONS = new Set(["upload_parts", "complete_upload"]);
+/** Next actions the server waits on the client, or its owner, for; polling cannot change them. */
+const CLIENT_ACTIONS = new Set(["upload_parts", "complete_upload", "review"]);
 
 type WebSource = Record<string, unknown> & { type: "web"; url: string };
 type VideoSource = { type: "video_url"; url: string };
@@ -93,6 +104,13 @@ type CreationPlan = {
 };
 
 type WaitSettings = { enabled: boolean; timeoutMs: number };
+
+type AppDataOptions = {
+  include_private?: true;
+  since?: string;
+  until?: string;
+  link_bases?: { datadog?: string; grafana?: string };
+};
 
 type WaitOutcome = {
   job: IngestionJob;
@@ -180,7 +198,7 @@ function webSource(arguments_: ParsedArguments, url: string): WebSource {
   if (hasOption(arguments_, "include-subdomains")) source.include_subdomains = true;
   if (hasOption(arguments_, "allow-documents")) source.allow_documents = true;
   if (hasOption(arguments_, "max-pages")) {
-    source.max_pages = integerOption(arguments_, "max-pages", 100, { min: 1, max: 1_000 });
+    source.max_pages = integerOption(arguments_, "max-pages", 100, { min: 1, max: 10_000 });
   }
   if (hasOption(arguments_, "max-depth")) {
     source.max_depth = integerOption(arguments_, "max-depth", 3, { min: 0, max: 10 });
@@ -208,6 +226,13 @@ function creationPlan(arguments_: ParsedArguments): CreationPlan {
   if (hasOption(arguments_, "parallel") && file === undefined && zip === undefined) {
     throw usage("parallel_requires_file", "--parallel applies only to --file or --zip.");
   }
+  const appOption =
+    file === undefined && zip === undefined
+      ? APP_DATA_OPTIONS.find((name) => hasOption(arguments_, name))
+      : undefined;
+  if (appOption) {
+    throw usage("app_option_requires_file", `--${appOption} applies only to --file or --zip.`);
+  }
   if (zip !== undefined && !/\.zip$/iu.test(zip)) {
     throw usage("zip_required", "--zip expects a .zip archive. Use --file for other files.");
   }
@@ -222,6 +247,56 @@ function creationPlan(arguments_: ParsedArguments): CreationPlan {
     return { name, source: { type: "video_url", url: httpUrl(videoUrl, "video-url") } };
   }
   return { name, source: webSource(arguments_, url!) };
+}
+
+function day(arguments_: ParsedArguments, name: "since" | "until"): string | undefined {
+  const value = option(arguments_, name)?.trim();
+  if (value === undefined) return undefined;
+  const parsed = new Date(`${value}T00:00:00Z`);
+  if (
+    !/^\d{4}-\d{2}-\d{2}$/u.test(value) ||
+    Number.isNaN(parsed.getTime()) ||
+    parsed.toISOString().slice(0, 10) !== value
+  ) {
+    throw usage("date_invalid", `--${name} must be a date written as YYYY-MM-DD.`);
+  }
+  return value;
+}
+
+/**
+ * What an upload of app exports (Slack, Teams, Datadog and the like) keeps.
+ * Any of these options answers the review up front, so the upload never
+ * pauses; private conversations stay out unless --include-private is given.
+ * kbDrop checks the Datadog site and Grafana address.
+ */
+function appDataOptions(arguments_: ParsedArguments): AppDataOptions | undefined {
+  if (!APP_DATA_OPTIONS.some((name) => hasOption(arguments_, name))) return undefined;
+  const since = day(arguments_, "since");
+  const until = day(arguments_, "until");
+  if (since && until && since > until) {
+    throw usage("date_range_invalid", "--since must not be later than --until.");
+  }
+  const linkBases: NonNullable<AppDataOptions["link_bases"]> = {};
+  for (const [name, kind] of [
+    ["datadog-site", "datadog"],
+    ["grafana-url", "grafana"],
+  ] as const) {
+    const value = option(arguments_, name)?.trim();
+    if (value === undefined) continue;
+    if (value.length === 0 || value.length > MAX_LINK_BASE_LENGTH) {
+      throw usage(
+        "link_base_invalid",
+        `--${name} must contain 1 to ${MAX_LINK_BASE_LENGTH} characters.`,
+      );
+    }
+    linkBases[kind] = value;
+  }
+  return {
+    ...(hasOption(arguments_, "include-private") ? { include_private: true as const } : {}),
+    ...(since ? { since } : {}),
+    ...(until ? { until } : {}),
+    ...(Object.keys(linkBases).length > 0 ? { link_bases: linkBases } : {}),
+  };
 }
 
 function waitSettings(arguments_: ParsedArguments, flag: "wait" | "watch"): WaitSettings {
@@ -387,8 +462,10 @@ function sourceLabel(knowledgeBase: KnowledgeBase): string {
 }
 
 /** What the person at the terminal can do next, or null when nothing is needed. */
-function nextStep(job: IngestionJob, id: string): string | null {
+function nextStep(job: IngestionJob, id: string, origin: string): string | null {
   switch (job.next_action) {
+    case "review":
+      return `Choose what it indexes at ${origin}/knowledge-bases/${id}, or run: kb-drop knowledge-bases review ${id} --index (or --cancel)`;
     case "upload_parts":
     case "complete_upload":
       return "The upload is incomplete. Run the same create command again to resume it.";
@@ -421,9 +498,10 @@ function writeHumanResult(
   knowledgeBase: KnowledgeBase,
   job: IngestionJob,
   outcome: WaitOutcome | null,
+  origin: string,
 ): void {
   const lines = [headline, outcomeLine(job, outcome)];
-  const next = nextStep(job, knowledgeBase.id);
+  const next = nextStep(job, knowledgeBase.id, origin);
   if (next) lines.push(next);
   output.stdout.write(`${lines.join("\n")}\n`);
 }
@@ -478,6 +556,7 @@ async function create(context: ManagementContext): Promise<number> {
     ...UPLOAD_OPTIONS,
     ...WEB_OPTIONS,
     ...REQUEST_OPTIONS,
+    ...APP_DATA_OPTIONS,
     "idempotency-key",
     "name",
     "url",
@@ -489,6 +568,7 @@ async function create(context: ManagementContext): Promise<number> {
     throw usage("unexpected_argument", `${command} does not accept positional arguments.`);
   }
   const plan = creationPlan(arguments_);
+  const appData = appDataOptions(arguments_);
   const wait = waitSettings(arguments_, "wait");
   const parallel = integerOption(arguments_, "parallel", DEFAULT_PARALLEL, {
     min: 1,
@@ -507,6 +587,7 @@ async function create(context: ManagementContext): Promise<number> {
       filename: file.filename,
       size_bytes: file.sizeBytes,
       fingerprint: await resumeFingerprint(file),
+      ...(appData ? { app_data: appData } : {}),
     };
   } else {
     source = plan.source!;
@@ -614,6 +695,7 @@ async function create(context: ManagementContext): Promise<number> {
       knowledgeBase,
       job,
       outcome,
+      context.origin,
     );
   }
   return waitExitCode(outcome);
@@ -659,7 +741,7 @@ async function status(context: ManagementContext): Promise<number> {
           : "no"
       }`,
     ];
-    const next = nextStep(job, knowledgeBase.id);
+    const next = nextStep(job, knowledgeBase.id, context.origin);
     if (next) lines.push(`Next:      ${next}`);
     output.stdout.write(`${lines.join("\n")}\n`);
   }
@@ -801,6 +883,7 @@ async function retry(context: ManagementContext): Promise<number> {
       knowledgeBase,
       job,
       outcome,
+      context.origin,
     );
   }
   return waitExitCode(outcome);
@@ -854,9 +937,110 @@ async function recrawl(context: ManagementContext): Promise<number> {
       knowledgeBase,
       job,
       outcome,
+      context.origin,
     );
   }
   return waitExitCode(outcome);
+}
+
+/** The keys of the exports a paused upload's review lists. */
+function reviewedExports(job: IngestionJob): string[] {
+  const review = job.review;
+  if (typeof review !== "object" || review === null) return [];
+  const exports = (review as { exports?: unknown }).exports;
+  if (!Array.isArray(exports)) return [];
+  return exports.flatMap((item: unknown) => {
+    const key = typeof item === "object" && item !== null ? (item as { key?: unknown }).key : null;
+    return typeof key === "string" ? [key] : [];
+  });
+}
+
+function reviewAnswer(job: IngestionJob, options: AppDataOptions): ReviewAnswerBody {
+  // The terminal answers for every export at once, as options given up front do.
+  const choice = {
+    include_private: options.include_private === true,
+    ...(options.since ? { since: options.since } : {}),
+    ...(options.until ? { until: options.until } : {}),
+  };
+  return {
+    decision: "index",
+    exports: Object.fromEntries(reviewedExports(job).map((key) => [key, choice])),
+    link_bases: options.link_bases ?? {},
+  };
+}
+
+async function review(context: ManagementContext): Promise<number> {
+  const { arguments_, output } = context;
+  const command = "knowledge-bases review";
+  ensureAllowed(arguments_, command, [
+    ...REQUEST_OPTIONS,
+    ...TARGET_OPTIONS,
+    ...APP_DATA_OPTIONS.filter((name) => name !== "skip-review"),
+    "cancel",
+    "index",
+    "wait",
+    "wait-timeout",
+  ]);
+  const id = targetId(arguments_, command);
+  const cancel = hasOption(arguments_, "cancel");
+  if (cancel === hasOption(arguments_, "index")) {
+    throw usage(
+      "review_decision_required",
+      "Choose one: --index to index the upload with your choices, or --cancel to cancel it.",
+    );
+  }
+  const misplaced = cancel
+    ? [...APP_DATA_OPTIONS, "wait", "wait-timeout"].find((name) => hasOption(arguments_, name))
+    : undefined;
+  if (misplaced) throw usage("option_requires_index", `--${misplaced} applies only with --index.`);
+  const options = cancel ? null : (appDataOptions(arguments_) ?? {});
+  const wait = waitSettings(arguments_, "wait");
+  const client = await managementClient(context, [WRITE, READ]);
+  const report = progressWriter(output, context.json, "knowledge-bases.review");
+
+  let knowledgeBase = await client.getKnowledgeBase(id);
+  const paused = await client.getIngestionJob(knowledgeBase.latest_job.id);
+  if (paused.next_action !== "review") {
+    throw new CliError("request", "review_not_pending", "The upload isn't waiting for a review.");
+  }
+  let job: IngestionJob;
+  let replayed = false;
+  try {
+    job = await client.answerIngestionReview(
+      paused.id,
+      options ? reviewAnswer(paused, options) : { decision: "cancel" },
+    );
+  } catch (error) {
+    // A lost response leaves the answer in place: report what it did.
+    if (!(error instanceof CliError) || error.kind !== "network") throw error;
+    job = await client.getIngestionJob(paused.id);
+    if (job.next_action === "review") throw error;
+    replayed = true;
+  }
+  report(ingestionEvent(job));
+  const outcome = await maybeWait(client, job, context, wait, report);
+  if (outcome) job = outcome.job;
+  knowledgeBase = await refreshed(client, knowledgeBase);
+  if (context.json) {
+    writeJsonSuccess(output, "knowledge-bases.review", {
+      knowledge_base: knowledgeBase,
+      ingestion_job: job,
+      decision: cancel ? "cancel" : "index",
+      resumed: replayed,
+    });
+  } else {
+    writeHumanResult(
+      output,
+      cancel
+        ? `Cancelled the upload for "${printable(knowledgeBase.name)}" (${knowledgeBase.id}).`
+        : `Indexing "${printable(knowledgeBase.name)}" (${knowledgeBase.id}) with your choices.`,
+      knowledgeBase,
+      job,
+      outcome,
+      context.origin,
+    );
+  }
+  return cancel ? 0 : waitExitCode(outcome);
 }
 
 export async function runKnowledgeBaseCommand(context: ManagementContext): Promise<number> {
@@ -871,6 +1055,8 @@ export async function runKnowledgeBaseCommand(context: ManagementContext): Promi
       return retry(context);
     case "recrawl":
       return recrawl(context);
+    case "review":
+      return review(context);
     default:
       throw usage(
         "knowledge_base_command_required",

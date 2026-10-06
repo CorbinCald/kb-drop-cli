@@ -79,6 +79,11 @@ export function writeError(
   return EXIT_CODES[failure.kind];
 }
 
+/** "Handbook · " when an interface answered, naming the source's knowledge base. */
+function knowledgeBasePrefix(label: { name: string } | undefined): string {
+  return label?.name ? `${printable(label.name, 80)} · ` : "";
+}
+
 export function writeHumanAnswer(
   streams: OutputStreams,
   completion: AskCompletion,
@@ -103,7 +108,7 @@ export function writeHumanAnswer(
       const link = citation.source_url ?? citation.deep_link;
       line(
         streams.stdout,
-        `[${citation.id}] ${citation.display_title}${location}${link ? ` — ${link}` : ""}`,
+        `[${citation.id}] ${knowledgeBasePrefix(citation.knowledge_base)}${citation.display_title}${location}${link ? ` — ${link}` : ""}`,
       );
     }
   }
@@ -129,7 +134,7 @@ export function writeHumanSearch(
           }`;
     line(
       streams.stdout,
-      `${index + 1}. ${result.source.relative_path}${lines} (${result.score.toFixed(3)})`,
+      `${index + 1}. ${knowledgeBasePrefix(result.knowledge_base)}${result.source.relative_path}${lines} (${result.score.toFixed(3)})`,
     );
     line(streams.stdout, result.chunk.content);
     if (index < response.results.length - 1) line(streams.stdout);
@@ -186,6 +191,7 @@ export function describeIngestion(
     }
     return "Completing upload";
   }
+  if (job.status === "reviewing") return "Paused for your review before indexing";
   if (job.status === "crawling" && crawl) {
     return `Crawling: ${crawl.pages_fetched} pages fetched, ${crawl.pages_indexed} indexed, ${crawl.pages_discovered} discovered`;
   }
