@@ -42,7 +42,7 @@ import {
   type OutputStreams,
 } from "./output.js";
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.3.0";
 const DEFAULT_API_URL = "https://kbdrop.io";
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
@@ -72,13 +72,16 @@ Usage:
   kb-drop knowledge-bases list [--limit N] [--cursor CURSOR]
   kb-drop knowledge-bases retry ID [--wait]
   kb-drop knowledge-bases recrawl ID [--wait]
+  kb-drop knowledge-bases review ID --index [app export controls] [--wait]|--cancel
   kb-drop completion bash|zsh|fish
 
   kb is short for knowledge-bases.
 
 Common options:
   --api-url URL              API origin (default: https://kbdrop.io)
-  --knowledge-base ID        Knowledge-base UUID (--kb is an alias)
+  --knowledge-base ID        Ask or search one knowledge base (--kb is an alias);
+                             without it, every knowledge base plugged into
+                             your interface is searched
   --input TEXT|-             Question text, or - to read stdin
   --input-file FILE          Read question/query text from a UTF-8 file
   --json                     Emit one versioned JSON object on stdout
@@ -102,7 +105,7 @@ Search controls:
   --path-prefix PATH         Restrict results to a relative path
 
 Create sources (choose one):
-  --file PATH                Upload a document, archive, audio, or video file (up to 1 GiB)
+  --file PATH                Upload a document, archive, audio, or video file (as your plan allows)
   --zip PATH                 Upload a .zip archive
   --url URL                  Crawl a public website
   --video-url URL            Transcribe a public video
@@ -114,9 +117,19 @@ Create controls:
   --parallel N               Upload 1-8 parts at once (default: 4)
   --idempotency-key UUID     Use your own key instead of saved resume state
 
+App export controls (with --file or --zip, and review --index):
+  An upload of Slack, Teams, Google Chat, Datadog, Grafana or similar exports
+  can pause for your review before indexing. Any of these answers it up front.
+  --include-private          Index private channels and direct messages too
+  --since YYYY-MM-DD         Index only records from this day on
+  --until YYYY-MM-DD         Index only records up to this day
+  --datadog-site SITE        Link Datadog records to this site, e.g. app.datadoghq.eu
+  --grafana-url URL          Link Grafana records under this HTTPS address
+  --skip-review              Index with the defaults, without pausing
+
 Website controls (with --url):
   --mode site|single_url     Crawl the site, or index one page (default: site)
-  --max-pages N              Stop after 1-1000 pages (default: 100)
+  --max-pages N              Stop after 1-10000 pages, as your plan allows (default: 100)
   --max-depth N              Follow links 0-10 levels deep (default: 3)
   --include-path PATTERN     Crawl only matching paths, e.g. /docs/*; repeatable
   --exclude-path PATTERN     Skip matching paths; repeatable
@@ -130,11 +143,12 @@ Website controls (with --url):
 Exit codes:
   0 success, 2 usage, 3 authentication, 4 request rejected, 5 temporary
   failure, 6 network, 7 unexpected response, 8 insufficient evidence,
-  9 ingestion failed or was cancelled, 10 stopped waiting before ingestion finished
+  9 ingestion failed or was cancelled, 10 stopped waiting before ingestion
+  finished (timed out, or the upload is waiting to resume or for your review)
 
 Environment:
   KB_DROP_API_URL            Default for --api-url
-  KB_DROP_KNOWLEDGE_BASE_ID  Default knowledge base for ask and search
+  KB_DROP_KNOWLEDGE_BASE_ID  Default for --knowledge-base
   KB_DROP_STATE_DIR          Where unfinished commands keep their resume state
 
 Authentication:
@@ -161,10 +175,11 @@ function apiUrl(
   );
 }
 
+/** Null asks the credential's interface, across everything plugged in. */
 function knowledgeBaseId(
   arguments_: ParsedArguments,
   environment: NodeJS.ProcessEnv,
-): string {
+): string | null {
   const short = option(arguments_, "kb");
   const long = option(arguments_, "knowledge-base");
   if (short && long) {
@@ -175,13 +190,7 @@ function knowledgeBaseId(
     );
   }
   const value = long ?? short ?? environment.KB_DROP_KNOWLEDGE_BASE_ID;
-  if (!value) {
-    throw new CliError(
-      "usage",
-      "knowledge_base_required",
-      "Provide --knowledge-base/--kb or set KB_DROP_KNOWLEDGE_BASE_ID.",
-    );
-  }
+  if (!value) return null;
   if (!UUID_PATTERN.test(value)) {
     throw new CliError(
       "usage",
@@ -262,7 +271,7 @@ function completionScript(shell: string): string {
   const commands = "auth ask search knowledge-bases kb completion";
   const subcommands = `login logout status ${KNOWLEDGE_BASE_COMMANDS.join(" ")}`;
   const common =
-    "--help --version --json --api-url --knowledge-base --kb --input --input-file --timeout --retries --manage --file --zip --url --video-url --name --wait --watch --wait-timeout --parallel --limit --cursor --mode --max-pages --max-depth --include-path --exclude-path --include-subdomains --allow-documents --render-mode --query-policy";
+    "--help --version --json --api-url --knowledge-base --kb --input --input-file --timeout --retries --manage --file --zip --url --video-url --name --wait --watch --wait-timeout --parallel --limit --cursor --mode --max-pages --max-depth --include-path --exclude-path --include-subdomains --allow-documents --render-mode --query-policy --include-private --since --until --datadog-site --grafana-url --skip-review --index --cancel";
   if (shell === "bash") {
     return `_kb_drop_complete() {\n  local current=\"\${COMP_WORDS[COMP_CWORD]}\"\n  COMPREPLY=( $(compgen -W \"${commands} ${subcommands} ${common}\" -- \"$current\") )\n}\ncomplete -F _kb_drop_complete kb-drop`;
   }

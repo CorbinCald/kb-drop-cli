@@ -862,6 +862,121 @@ describe("knowledge-bases status, list, retry, and recrawl", () => {
   });
 });
 
+describe("uploads that pause for review", () => {
+  const exportKey = "slack.workspace.0123456789abcdef";
+
+  it("stops waiting at a review and indexes with the choices given in the terminal", async () => {
+    const fake = new FakeKbDrop();
+    fake.jobScript = ["parsing", "reviewing", "embedding", "ready"];
+    const path = await localFile("slack-export.zip");
+    const clock = new Clock();
+
+    const paused = await run(fake, ["kb", "create", "--file", path, "--wait"], { clock });
+
+    const [knowledgeBase] = [...fake.knowledgeBases.values()];
+    const id = knowledgeBase!.id;
+    expect(paused.exitCode).toBe(10);
+    // It stops once the job waits for its owner, well before the wait timeout.
+    expect(clock.sleeps.reduce((total, milliseconds) => total + milliseconds, 0)).toBeLessThan(60_000);
+    expect(paused.stdout).toContain("Paused for your review before indexing.");
+    expect(paused.stdout).toContain(
+      `Choose what it indexes at ${API_URL}/knowledge-bases/${id}, or run: kb-drop knowledge-bases review ${id} --index (or --cancel)`,
+    );
+
+    const answered = await run(
+      fake,
+      [
+        "kb",
+        "review",
+        id,
+        "--index",
+        "--since",
+        "2026-09-01",
+        "--datadog-site",
+        "app.datadoghq.eu",
+        "--wait",
+        "--json",
+      ],
+      { clock },
+    );
+
+    expect(answered.exitCode).toBe(0);
+    expect(JSON.parse(answered.stdout)).toMatchObject({
+      command: "knowledge-bases.review",
+      data: { decision: "index", resumed: false, ingestion_job: { status: "ready" } },
+    });
+    expect(fake.apiRequests(/\/review$/u).map((request) => request.body)).toEqual([
+      {
+        decision: "index",
+        exports: { [exportKey]: { include_private: false, since: "2026-09-01" } },
+        link_bases: { datadog: "app.datadoghq.eu" },
+      },
+    ]);
+    expectCleanOutput(answered);
+  });
+
+  it("sends app-export options up front so the upload never pauses", async () => {
+    const fake = new FakeKbDrop();
+    const path = await localFile("slack-export.zip");
+
+    const result = await run(fake, [
+      "kb",
+      "create",
+      "--file",
+      path,
+      "--include-private",
+      "--since",
+      "2026-01-01",
+      "--until",
+      "2026-06-30",
+      "--grafana-url",
+      "https://ops.example.com/grafana",
+    ]);
+    const defaults = await run(fake, ["kb", "create", "--zip", path, "--skip-review"]);
+
+    expect([result.exitCode, defaults.exitCode]).toEqual([0, 0]);
+    expect(createBodies(fake).map((body) => (body.source as { app_data?: unknown }).app_data)).toEqual([
+      {
+        include_private: true,
+        since: "2026-01-01",
+        until: "2026-06-30",
+        link_bases: { grafana: "https://ops.example.com/grafana" },
+      },
+      {},
+    ]);
+  });
+
+  it("cancels a paused upload once, and reports a lost answer from the job", async () => {
+    const fake = new FakeKbDrop();
+    fake.jobScript = ["reviewing", "embedding", "ready"];
+    const path = await localFile("slack-export.zip");
+    await run(fake, ["kb", "create", "--file", path]);
+    await run(fake, ["kb", "create", "--zip", path, "--name", "Second"]);
+    const [first, second] = [...fake.knowledgeBases.values()];
+
+    const status = await run(fake, ["kb", "status", first!.id]);
+    expect(status.stdout).toContain("Status:    Paused for your review before indexing.");
+    expect(status.stdout).toContain(`Next:      Choose what it indexes at ${API_URL}/knowledge-bases/${first!.id}`);
+
+    const cancelled = await run(fake, ["kb", "review", first!.id, "--cancel"]);
+    expect(cancelled.exitCode).toBe(0);
+    expect(cancelled.stdout).toContain(`Cancelled the upload for "slack-export.zip" (${first!.id}).`);
+    const again = await run(fake, ["kb", "review", first!.id, "--cancel", "--json"]);
+    expect(again.exitCode).toBe(4);
+    expect(json(again.stderr).error.code).toBe("review_not_pending");
+
+    await run(fake, ["kb", "status", second!.id]);
+    fake.lostReviewResponses = 1;
+    const lost = await run(fake, ["kb", "review", second!.id, "--index", "--include-private", "--json"]);
+    expect(lost.exitCode).toBe(0);
+    expect(JSON.parse(lost.stdout)).toMatchObject({
+      data: { decision: "index", resumed: true, ingestion_job: { status: "embedding" } },
+    });
+    // The answer was sent once; the job showed it had been applied.
+    expect(fake.apiRequests(new RegExp(`/${second!.latestJobId}/review$`, "u"))).toHaveLength(1);
+  });
+});
+
 describe("management credentials", () => {
   it("never sends a knowledge-base API key or a query-only login to management endpoints", async () => {
     const fake = new FakeKbDrop();
@@ -1169,7 +1284,7 @@ describe("argument validation", () => {
       [["kb", "create", "--file", file, "--wait-timeout", "5"], "wait_timeout_requires_wait"],
       [["kb", "create", "--url", "https://a.example", "--include-path", "docs"], "path_pattern_invalid"],
       [["kb", "create", "--url", "https://a.example", "--mode", "everything"], "invalid_option_value"],
-      [["kb", "create", "--url", "https://a.example", "--max-pages", "1001"], "invalid_option_value"],
+      [["kb", "create", "--url", "https://a.example", "--max-pages", "10001"], "invalid_option_value"],
       [["kb", "create", "--url", "ftp://a.example"], "url_invalid"],
       [["kb", "create", "--url", "https://a.example", "--name", "x".repeat(121)], "name_invalid"],
       [["kb", "create", "--url", "https://a.example", "--idempotency-key", "abc"], "uuid_invalid"],
@@ -1178,6 +1293,26 @@ describe("argument validation", () => {
       [["kb", "create", "--file", empty], "file_empty"],
       [["kb", "create", "--url", "https://a.example", "--management-key", "x"], "secret_argument_forbidden"],
       [["kb", "create", "--url", "https://a.example", "--top-k", "3"], "option_not_supported"],
+      [["kb", "create", "--url", "https://a.example", "--include-private"], "app_option_requires_file"],
+      [["kb", "create", "--file", file, "--since", "2026-02-30"], "date_invalid"],
+      [
+        ["kb", "create", "--file", file, "--since", "2026-09-02", "--until", "2026-09-01"],
+        "date_range_invalid",
+      ],
+      [["kb", "create", "--file", file, "--grafana-url", " "], "link_base_invalid"],
+      [["kb", "review", "00000000-0000-4000-8000-000000000001"], "review_decision_required"],
+      [
+        ["kb", "review", "00000000-0000-4000-8000-000000000001", "--index", "--cancel"],
+        "review_decision_required",
+      ],
+      [
+        ["kb", "review", "00000000-0000-4000-8000-000000000001", "--cancel", "--since", "2026-09-01"],
+        "option_requires_index",
+      ],
+      [
+        ["kb", "review", "00000000-0000-4000-8000-000000000001", "--index", "--skip-review"],
+        "option_not_supported",
+      ],
       [["kb", "status"], "knowledge_base_required"],
       [["kb", "status", "not-a-uuid"], "knowledge_base_invalid"],
       [["kb", "delete"], "knowledge_base_command_required"],

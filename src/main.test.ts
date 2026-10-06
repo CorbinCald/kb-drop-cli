@@ -750,6 +750,168 @@ describe("@kbdrop/cli", () => {
     }
   });
 
+  it("asks the credential's interface when no knowledge base is given", async () => {
+    const handbook = { id: knowledgeBaseId, name: "Handbook" };
+    const code = { id: "30000000-0000-4000-8000-000000000002", name: "Billing\u001b[31m service" };
+    const answer = {
+      ...completion(),
+      knowledge_base_id: null,
+      interface_id: "40000000-0000-4000-8000-000000000001",
+      knowledge_base_ids: [handbook.id, code.id],
+      answer: "Reset it, then check the quota. [S1][S2]",
+      citations: [
+        {
+          id: "S1",
+          source_id: "source-1",
+          display_title: "Reset guide",
+          modality: "text",
+          source_url: null,
+          deep_link: "https://kbdrop.io/v1/knowledge-bases/a/sources/source-1",
+          locator: { pages: [2] },
+          locator_text: "page 2",
+          knowledge_base: handbook,
+        },
+        {
+          id: "S2",
+          source_id: "source-2",
+          display_title: "quota.ts",
+          modality: "text",
+          source_url: null,
+          deep_link: null,
+          locator: { startLine: 41, endLine: 44 },
+          locator_text: "lines 41-44",
+          knowledge_base: code,
+        },
+      ],
+    };
+    const urls: string[] = [];
+    const stdout = capture();
+    const exitCode = await runCli(["ask", "--input", "How do I reset it?"], {
+      store: new MemoryStore(),
+      stdout: stdout.stream,
+      stderr: capture().stream,
+      environment: { NODE_ENV: "test", KB_DROP_API_KEY: apiKey },
+      fetchImpl: async (input) => {
+        urls.push(String(input));
+        return Response.json(answer);
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(urls).toEqual([`${apiUrl}/v1/messages`]);
+    expect(stdout.value()).toContain(
+      "[S1] Handbook · Reset guide — page 2 — https://kbdrop.io/v1/knowledge-bases/a/sources/source-1",
+    );
+    // A knowledge base's name is the owner's text, so it is made printable.
+    expect(stdout.value()).toContain("[S2] Billing [31m service · quota.ts — lines 41-44");
+  });
+
+  it("searches the credential's interface, and one knowledge base when named", async () => {
+    const result = {
+      id: "result-1",
+      score: 0.91,
+      chunk: { id: "chunk-1", content: "Quota is checked here.", token_count: 5 },
+      source: {
+        id: "source-1",
+        filename: "quota.ts",
+        relative_path: "src/quota.ts",
+        language: "typescript",
+      },
+      symbol: { name: "reserveQuota", kind: "function" },
+      location: { start_line: 41, end_line: 44 },
+    };
+    const urls: string[] = [];
+    const outputs: string[] = [];
+    for (const named of [false, true]) {
+      const stdout = capture();
+      const exitCode = await runCli(
+        [
+          "search",
+          "--query",
+          "Where is quota enforced?",
+          ...(named ? ["--kb", knowledgeBaseId] : []),
+        ],
+        {
+          store: new MemoryStore(),
+          stdout: stdout.stream,
+          stderr: capture().stream,
+          environment: { NODE_ENV: "test", KB_DROP_API_KEY: apiKey },
+          fetchImpl: async (input) => {
+            urls.push(String(input));
+            return Response.json({
+              request_id: "10000000-0000-4000-8000-000000000003",
+              operation_id: "10000000-0000-4000-8000-000000000003",
+              knowledge_base_id: named ? knowledgeBaseId : null,
+              empty: { is_empty: false, reason: null, threshold: named ? 0.04 : null },
+              results: [
+                named
+                  ? result
+                  : { ...result, knowledge_base: { id: knowledgeBaseId, name: "Billing service" } },
+              ],
+            });
+          },
+        },
+      );
+      expect(exitCode).toBe(0);
+      outputs.push(stdout.value());
+    }
+    expect(urls).toEqual([
+      `${apiUrl}/v1/search`,
+      `${apiUrl}/v1/knowledge-bases/${knowledgeBaseId}/search`,
+    ]);
+    expect(outputs[0]).toContain("1. Billing service · src/quota.ts:41-44 (0.910)");
+    expect(outputs[1]).toContain("1. src/quota.ts:41-44 (0.910)");
+  });
+
+  it("explains an interface with nothing plugged in", async () => {
+    const stderr = capture();
+    const exitCode = await runCli(["ask", "--input", "reset", "--json"], {
+      store: new MemoryStore(),
+      stdout: capture().stream,
+      stderr: stderr.stream,
+      environment: { NODE_ENV: "test", KB_DROP_API_KEY: apiKey },
+      fetchImpl: async () =>
+        Response.json(
+          { error: { code: "no_knowledge_bases_connected", message: "Server text" } },
+          { status: 409 },
+        ),
+    });
+    expect(exitCode).toBe(4);
+    expect(JSON.parse(stderr.value())).toMatchObject({
+      ok: false,
+      error: {
+        code: "no_knowledge_bases_connected",
+        message:
+          "No knowledge bases are plugged into this interface. Plug one in on the switchboard, or pass --knowledge-base.",
+      },
+    });
+  });
+
+  it("asks for a knowledge base where the server has no switchboard yet", async () => {
+    for (const command of [["ask", "--input", "reset"], ["search", "--query", "reset"]]) {
+      const stderr = capture();
+      const exitCode = await runCli([...command, "--json"], {
+        store: new MemoryStore(),
+        stdout: capture().stream,
+        stderr: stderr.stream,
+        environment: { NODE_ENV: "test", KB_DROP_API_KEY: apiKey },
+        fetchImpl: async () =>
+          Response.json(
+            { error: { code: "not_found", message: "The switchboard is not available." } },
+            { status: 404 },
+          ),
+      });
+      expect(exitCode).toBe(2);
+      expect(JSON.parse(stderr.value())).toMatchObject({
+        ok: false,
+        error: {
+          code: "knowledge_base_required",
+          message: "Provide --knowledge-base/--kb or set KB_DROP_KNOWLEDGE_BASE_ID.",
+        },
+      });
+    }
+  });
+
   it("never echoes server bodies, prompts, credentials, signed URLs, or input paths", async () => {
     const stdout = capture();
     const stderr = capture();

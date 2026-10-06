@@ -18,15 +18,22 @@ export type Citation = {
   locator: Record<string, unknown>;
   locator_text: string;
   excerpt?: string;
+  /** Present when an interface answered. */
+  knowledge_base?: KnowledgeBaseLabel;
   [key: string]: unknown;
 };
+
+export type KnowledgeBaseLabel = { id: string; name: string };
 
 export type AskCompletion = {
   type: "response.completed";
   request_id: string;
   operation_id: string;
   conversation_id: string;
-  knowledge_base_id: string;
+  /** Null when an interface answered from several knowledge bases. */
+  knowledge_base_id: string | null;
+  interface_id?: string;
+  knowledge_base_ids?: string[];
   answer_model: string | null;
   citations: Citation[];
   insufficient_evidence: boolean;
@@ -43,8 +50,10 @@ export type AskCompletion = {
 export type SearchResponse = {
   request_id: string;
   operation_id: string;
-  knowledge_base_id: string;
-  empty: { is_empty: boolean; reason: string | null; threshold: number };
+  knowledge_base_id: string | null;
+  interface_id?: string;
+  knowledge_base_ids?: string[];
+  empty: { is_empty: boolean; reason: string | null; threshold: number | null };
   results: Array<{
     id: string;
     score: number;
@@ -57,6 +66,8 @@ export type SearchResponse = {
     };
     symbol: { name: string | null; kind: string | null };
     location: { start_line: number | null; end_line: number | null };
+    /** Present when an interface searched. */
+    knowledge_base?: KnowledgeBaseLabel;
     [key: string]: unknown;
   }>;
   [key: string]: unknown;

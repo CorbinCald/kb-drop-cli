@@ -6,8 +6,12 @@ import { CliError } from "./errors.js";
 import type { ConfirmedPart, ManagementClient } from "./management.js";
 import type { IngestionJob, SignedPart, Upload } from "./types.js";
 
-/** kbDrop's per-file ceiling; media types have smaller limits the server enforces. */
-export const MAX_UPLOAD_BYTES = 1024 ** 3;
+/**
+ * kbDrop's largest upload, an archive on its largest plan. The server holds each
+ * account to its own plan's limit, a direct file to 1 GiB, and media types to
+ * smaller limits.
+ */
+export const MAX_UPLOAD_BYTES = 10 * 1024 ** 3;
 const FINGERPRINT_VERSION = "sha256-tree-v1";
 const FINGERPRINT_CHUNK_BYTES = 16 * 1024 * 1024;
 const PART_ATTEMPTS = 4;
@@ -70,7 +74,7 @@ export async function inspectLocalFile(path: string): Promise<LocalFile> {
   }
   if (stats.size === 0) throw new CliError("usage", "file_empty", "The file is empty.");
   if (stats.size > MAX_UPLOAD_BYTES) {
-    throw new CliError("usage", "file_too_large", "Files may be at most 1 GiB.");
+    throw new CliError("usage", "file_too_large", "Files may be at most 10 GiB.");
   }
   const filename = basename(path);
   if (filename.length > 255) {
