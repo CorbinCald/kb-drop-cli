@@ -399,7 +399,7 @@ async function waitForJob(
   for (;;) {
     const waitedForMs = context.now() - started;
     if (job.terminal) return { job, settled: "terminal", waitedForMs };
-    if (CLIENT_ACTIONS.has(job.next_action)) {
+    if (job.poll_after_seconds === null || CLIENT_ACTIONS.has(job.next_action)) {
       return { job, settled: "client_action", waitedForMs };
     }
     const remaining = deadline - context.now();
@@ -472,6 +472,7 @@ function nextStep(job: IngestionJob, id: string, origin: string): string | null 
     case "wait":
       return `Follow progress with: kb-drop knowledge-bases status ${id} --watch`;
     case "retry":
+      if (job.status === "paused") return `Resume when allowance is available with: kb-drop knowledge-bases retry ${id}`;
       return `Retry with: kb-drop knowledge-bases retry ${id}`;
     case "create_new_knowledge_base":
       return "This source cannot be processed again. Create a new knowledge base.";
@@ -483,6 +484,9 @@ function nextStep(job: IngestionJob, id: string, origin: string): string | null 
 }
 
 function outcomeLine(job: IngestionJob, outcome: WaitOutcome | null): string {
+  if (job.status === "paused") {
+    return `Crawl paused. ${job.failure ? printable(job.failure.message) : "Progress is saved."}`;
+  }
   if (job.failure) {
     return `Failed while ${printable(job.failure.stage)}: ${printable(job.failure.message)}`;
   }

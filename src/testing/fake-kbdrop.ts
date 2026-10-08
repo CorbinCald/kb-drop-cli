@@ -400,6 +400,9 @@ export class FakeKbDrop {
     } else if (job.status === "reviewing") {
       nextAction = "review";
       poll = null;
+    } else if (job.status === "paused") {
+      nextAction = "retry";
+      poll = null;
     } else if (job.status === "uploading") {
       if (upload?.status === "uploading") {
         nextAction = upload.confirmed.size < upload.partCount ? "upload_parts" : "complete_upload";
@@ -486,7 +489,7 @@ export class FakeKbDrop {
 
   private advance(job: Job): void {
     // A paused upload waits for its owner, however often it is polled.
-    if (job.status === "reviewing") return;
+    if (job.status === "reviewing" || job.status === "paused") return;
     const next = job.script.shift();
     if (!next) return;
     job.status = next;

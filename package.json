@@ -1,6 +1,6 @@
 {
   "name": "@kbdrop/cli",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Official command-line interface for creating and querying kbDrop knowledge bases",
   "license": "MIT",
   "type": "module",
