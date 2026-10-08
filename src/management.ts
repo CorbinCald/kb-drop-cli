@@ -241,11 +241,12 @@ export class ManagementClient {
   async retryIngestionJob(
     id: string,
     attempt: number,
+    resumeKey?: string,
   ): Promise<{ replayed: boolean; job: IngestionJob }> {
     const { response, value } = await this.request(
       "POST",
       `/v1/ingestion-jobs/${encodeURIComponent(id)}/retry`,
-      { attempt },
+      { attempt, ...(resumeKey ? { resume_key: resumeKey } : {}) },
     );
     if (!isIngestionJob(value)) throw unexpected();
     return {

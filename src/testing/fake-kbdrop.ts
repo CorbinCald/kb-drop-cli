@@ -157,6 +157,7 @@ export class FakeKbDrop {
   lostCreateResponses = 0;
   /** Retries this many jobs but loses the response. */
   lostRetryResponses = 0;
+  readonly resumeReceipts = new Set<string>();
   /** Complete replies 202 this many times while storage assembles the parts. */
   completingReplies = 0;
   /** Parts storage discards once while assembling the upload, as a rejected part is. */
@@ -713,11 +714,26 @@ export class FakeKbDrop {
       if (job.attempt < attempt) {
         return apiError(409, "ingestion_attempt_mismatch", "fix_request");
       }
-      if (job.status !== "failed" || job.failure?.recovery !== "retry") {
-        return apiError(409, "ingestion_not_retryable", "create_new_knowledge_base");
+      const receipt = `${job.id}:${attempt}:${String(input.resume_key)}`;
+      if (input.resume_key) {
+        if (this.resumeReceipts.has(receipt)) {
+          return Response.json(this.serializeJob(job), {
+            headers: { "X-Idempotent-Replay": "true" },
+          });
+        }
+        if (job.status !== "paused") return apiError(409, "ingestion_not_paused", "fix_request");
       }
-      job.attempt += 1;
-      job.status = "queued";
+      if (job.status === "paused") {
+        if (!input.resume_key) return apiError(400, "resume_key_required", "fix_request");
+        this.resumeReceipts.add(receipt);
+        job.status = "crawling";
+      } else {
+        if (job.status !== "failed" || job.failure?.recovery !== "retry") {
+          return apiError(409, "ingestion_not_retryable", "create_new_knowledge_base");
+        }
+        job.attempt += 1;
+        job.status = "queued";
+      }
       job.failure = null;
       job.script = [...this.jobScript];
       if (this.lostRetryResponses > 0) {
