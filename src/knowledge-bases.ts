@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   ensureAllowed,
   hasOption,
@@ -826,12 +827,13 @@ async function replayRetry(
   client: ManagementClient,
   pending: PendingRetry,
 ): Promise<{ replayed: boolean; job: IngestionJob } | null> {
-  const { jobId, attempt } = pending.target!;
+  const { jobId, attempt, resumeKey } = pending.target!;
   try {
-    return await client.retryIngestionJob(jobId, attempt);
+    return await client.retryIngestionJob(jobId, attempt, resumeKey);
   } catch (error) {
     if (!(error instanceof CliError) || error.code !== "ingestion_job_superseded") throw error;
     await pending.finish();
+    if (resumeKey) throw error;
     return null;
   }
 }
@@ -864,8 +866,9 @@ async function retry(context: ManagementContext): Promise<number> {
     if (failed.next_action !== "retry") throw notRetryable(failed);
     // Naming the failed attempt makes a repeated retry a replay, not a second
     // run. It is saved first, so a rerun after a lost response replays it too.
-    await pending.save({ jobId: failed.id, attempt: failed.attempt });
-    retried = await client.retryIngestionJob(failed.id, failed.attempt);
+    const resumeKey = failed.status === "paused" ? randomUUID() : undefined;
+    await pending.save({ jobId: failed.id, attempt: failed.attempt, resumeKey });
+    retried = await client.retryIngestionJob(failed.id, failed.attempt, resumeKey);
   }
   let { job } = retried;
   report(ingestionEvent(job));
@@ -873,7 +876,7 @@ async function retry(context: ManagementContext): Promise<number> {
   if (outcome) job = outcome.job;
   knowledgeBase = await client.getKnowledgeBase(id);
   // Once this can report how the attempt ended, running it again retries anew.
-  if (!outcome || outcome.settled === "terminal") await pending.finish();
+  if (!outcome || outcome.settled === "terminal" || outcome.settled === "client_action") await pending.finish();
   if (context.json) {
     writeJsonSuccess(output, "knowledge-bases.retry", {
       knowledge_base: knowledgeBase,

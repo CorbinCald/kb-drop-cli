@@ -131,7 +131,9 @@ same run. Once a command finishes, its key is forgotten, so running it again
 creates another knowledge base. Unfinished keys expire after 24 hours. If the
 interrupted upload itself expired, the CLI says so and starts a new knowledge
 base. `retry` saves the failed attempt it retries in the same way, so running it
-again follows that attempt instead of queuing another.
+again follows that attempt instead of queuing another. For a spending-paused crawl,
+it also saves a resume key: a lost response replays the same resume even if the
+crawl has since completed, failed, or paused again.
 
 The state directory is `KB_DROP_STATE_DIR`, or by default
 `$XDG_STATE_HOME/kb-drop` (`~/.local/state/kb-drop`) on Linux,
@@ -151,7 +153,9 @@ the same knowledge base, and the same key with a different request fails with
 - `status ID` reports the knowledge base and its latest ingestion job.
 - `list [--limit N] [--cursor CURSOR]` pages through the account's knowledge
   bases, newest first.
-- `retry ID` requeues a failed job when its `next_action` is `retry`. Rerun
+- `retry ID` resumes a spending-paused crawl from its saved progress, or requeues
+  a failed job, when its `next_action` is `retry`. A resume retains the same
+  attempt and ingestion charge. Rerun
   after an interruption, it follows the attempt it already queued; once it has
   reported how that attempt ended, running it again retries anew.
 - `recrawl ID` crawls a website knowledge base again as a new version; the

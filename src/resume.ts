@@ -20,7 +20,7 @@ export type PendingOperation = {
   finish(): Promise<void>;
 };
 
-export type RetryTarget = { jobId: string; attempt: number };
+export type RetryTarget = { jobId: string; attempt: number; resumeKey?: string };
 
 export type PendingRetry = {
   /** The failed attempt an earlier, interrupted run already asked to retry. */
@@ -179,12 +179,20 @@ export async function pendingRetry(input: {
     UUID_PATTERN.test(saved.job_id) &&
     typeof saved.attempt === "number" &&
     Number.isSafeInteger(saved.attempt) &&
-    saved.attempt >= 1
-      ? { jobId: saved.job_id, attempt: saved.attempt }
+    saved.attempt >= 1 &&
+    (saved.resume_key === undefined ||
+      (typeof saved.resume_key === "string" && UUID_PATTERN.test(saved.resume_key)))
+      ? {
+          jobId: saved.job_id,
+          attempt: saved.attempt,
+          ...(saved.resume_key ? { resumeKey: saved.resume_key as string } : {}),
+        }
       : null;
   return {
     target,
-    save: ({ jobId, attempt }) => record.save({ job_id: jobId, attempt }),
+    save: ({ jobId, attempt, resumeKey }) => record.save({
+      job_id: jobId, attempt, ...(resumeKey ? { resume_key: resumeKey } : {}),
+    }),
     finish: () => record.remove(),
   };
 }

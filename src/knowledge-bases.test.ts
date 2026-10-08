@@ -764,6 +764,45 @@ describe("knowledge-bases status, list, retry, and recrawl", () => {
     expect(await pendingRecords()).toEqual([]);
   });
 
+  it.each(["embedding", "ready", "failed", "paused"])(
+    "replays an interrupted resume after the crawl becomes %s without billing another attempt",
+    async (status) => {
+      const fake = new FakeKbDrop();
+      const { knowledgeBaseId, jobId } = fake.addKnowledgeBase({
+        name: "Saved crawl", source: { type: "web", url: "https://docs.example.com", mode: "site" },
+        status: "paused",
+      });
+      fake.lostRetryResponses = 1;
+      const argv = ["kb", "retry", knowledgeBaseId, "--json"];
+      const lost = await run(fake, [...argv, "--retries", "0"]);
+      expect(lost.exitCode).toBe(6);
+      expect(await pendingRecords()).toHaveLength(1);
+      const job = fake.jobs.get(jobId)!;
+      job.status = status;
+      job.script = [];
+      job.failure = status === "failed" ? fake.jobFailure : null;
+      const replay = await run(fake, argv);
+      expect(replay.exitCode).toBe(0);
+      expect(json(replay.stdout).data).toMatchObject({
+        resumed: true, ingestion_job: { id: jobId, attempt: 1, status },
+      });
+      const requests = fake.apiRequests(/\/retry$/u);
+      expect(requests).toHaveLength(2);
+      expect(requests[0]!.body).toEqual(requests[1]!.body);
+      expect(requests[0]!.body).toMatchObject({attempt:1,resume_key:expect.any(String)});
+      expect(await pendingRecords()).toEqual([]);
+      if (status === "paused") {
+        fake.jobScript = ["ready"];
+        const next = await run(fake, [...argv, "--wait"]);
+        expect(next.exitCode).toBe(0);
+        expect(json(next.stdout).data).toMatchObject({
+          resumed:false, ingestion_job:{status:"ready",attempt:1},
+        });
+        expect(fake.apiRequests(/\/retry$/u)[2]!.body).not.toEqual(requests[0]!.body);
+      }
+    },
+  );
+
   it("keeps a retry's attempt until the command has reported how it ended", async () => {
     const fake = new FakeKbDrop();
     const { knowledgeBaseId } = fake.addKnowledgeBase({
