@@ -865,6 +865,17 @@ describe("knowledge-bases status, list, retry, and recrawl", () => {
 describe("uploads that pause for review", () => {
   const exportKey = "slack.workspace.0123456789abcdef";
 
+  it("stops watching a spending-paused crawl and explains how to resume it", async () => {
+    const fake = new FakeKbDrop();
+    fake.jobScript = ["crawling", "paused"];
+    const clock = new Clock();
+    const paused = await run(fake, ["kb", "create", "--url", "https://docs.example.com/", "--wait"], {clock});
+    expect(paused.exitCode).toBe(10);
+    expect(clock.sleeps.reduce((total, ms)=>total+ms,0)).toBeLessThan(60_000);
+    expect(paused.stdout).toContain("Crawl paused. Progress is saved.");
+    expect(paused.stdout).toContain("Resume when allowance is available with: kb-drop knowledge-bases retry");
+  });
+
   it("stops waiting at a review and indexes with the choices given in the terminal", async () => {
     const fake = new FakeKbDrop();
     fake.jobScript = ["parsing", "reviewing", "embedding", "ready"];
